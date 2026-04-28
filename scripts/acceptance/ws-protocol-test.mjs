@@ -1,9 +1,13 @@
 // Black-box WebSocket acceptance test against any AWR-V3 backend.
-// Works against both the Zig firmware binary and the Node simulator —
-// the only thing it requires is a listener at WS_URL that speaks the
-// AWR-V3 protocol (auth, get_info, movement, mapping, get_map,
-// slam_plan). Uses the Node 22 built-in WebSocket so we don't need
-// the `ws` package in the acceptance container.
+// Works against three implementations: the Zig firmware binary, the
+// Node simulator, and the vendor Python `WebServer.py` (which is a
+// strict subset — no SLAM extensions). Set INCLUDE_SLAM=1 to also
+// assert mapping, get_map, slam_plan, and pose tracking; without it
+// the test only exercises the common protocol subset that EVERY
+// implementation must support.
+//
+// Uses the Node 22 built-in WebSocket so we don't need the `ws`
+// package in the acceptance container.
 //
 // Failing assertions exit non-zero with a clear stderr message so the
 // orchestrator can capture and report them.
@@ -13,6 +17,8 @@ import assert from "node:assert/strict";
 const WS_URL = process.env.WS_URL ?? "ws://127.0.0.1:8889";
 const AUTH = process.env.WS_AUTH ?? "admin:123456";
 const TIMEOUT_MS = Number(process.env.WS_TIMEOUT_MS ?? 5000);
+const INCLUDE_SLAM = process.env.INCLUDE_SLAM === "1";
+const BACKEND_LABEL = process.env.BACKEND_LABEL ?? "unknown";
 
 if (typeof globalThis.WebSocket !== "function") {
   console.error("Node 22+ is required (built-in WebSocket missing).");
@@ -64,63 +70,96 @@ async function authenticate(ws) {
 
 async function main() {
   const ws = await open();
+  const summary = { ok: false, backend_url: WS_URL, backend: BACKEND_LABEL, slam_tested: INCLUDE_SLAM };
   try {
     await authenticate(ws);
 
-    // 1. Telemetry envelope shape
+    // ---------- common protocol subset (every backend MUST support) ----------
+
+    // 1. Telemetry envelope. The vendor Python returns 3 numbers and
+    //    a 4th may be added by Zig (battery). We accept either >=3.
     const info = JSON.parse(await send(ws, "get_info"));
     assert.equal(info.title, "get_info");
-    assert.ok(Array.isArray(info.data) && info.data.length === 4, "get_info data must be 4-element array");
+    assert.ok(Array.isArray(info.data), "get_info data must be an array");
+    assert.ok(info.data.length >= 3, `get_info data must have >=3 entries, got ${info.data.length}`);
     for (const v of info.data) assert.ok(Number.isFinite(Number.parseFloat(v)), `get_info value not numeric: ${v}`);
+    summary.get_info_len = info.data.length;
 
-    // 2. SLAM round-trip
-    assert.equal(JSON.parse(await send(ws, "slam_reset")).status, "ok");
-    const before = JSON.parse(await send(ws, "get_map"));
-    assert.equal(before.title, "get_map", "get_map title");
-    assert.ok(typeof before.data.grid === "string", "grid must be a string");
-    assert.equal(before.data.grid.length, before.data.size * before.data.size, "grid size mismatch");
-    assert.equal(before.data.mapping, false, "fresh state should not be mapping");
+    // 2. Movement and stop commands always ack
+    for (const cmd of ["forward", "DS", "backward", "DS", "left", "TS", "right", "TS",
+                       "rotate-left", "TS", "rotate-right", "TS",
+                       "up", "UDstop", "down", "UDstop"]) {
+      assert.equal(JSON.parse(await send(ws, cmd)).status, "ok", `cmd ${cmd}`);
+    }
 
-    assert.equal(JSON.parse(await send(ws, "mapping")).title, "mapping");
-    for (let i = 0; i < 6; i++) await send(ws, "forward");
-    const after = JSON.parse(await send(ws, "get_map"));
-    assert.equal(after.title, "get_map");
-    assert.equal(after.data.mapping, true, "mapping flag should be true after `mapping`");
-    assert.ok(after.data.x >= before.data.x,
-      `pose_x should advance forward (or stay clamped): before=${before.data.x} after=${after.data.x}`);
+    // 3. Speed setting
+    assert.equal(JSON.parse(await send(ws, "wsB 30")).status, "ok");
 
-    // 3. Path planning envelope
-    const plan = JSON.parse(await send(ws, "slam_plan 50 50"));
-    assert.equal(plan.title, "slam_plan");
-    assert.equal(typeof plan.data.found, "boolean");
-    assert.equal(typeof plan.data.length, "number");
+    // 4. LED port switches
+    for (const cmd of ["Switch_1_on", "Switch_2_on", "Switch_3_on",
+                       "Switch_1_off", "Switch_2_off", "Switch_3_off"]) {
+      assert.equal(JSON.parse(await send(ws, cmd)).status, "ok", `cmd ${cmd}`);
+    }
 
-    // 4. Pose tracking on rotation
-    const heading0 = after.data.theta;
-    for (let i = 0; i < 4; i++) await send(ws, "rotate-left");
-    const turned = JSON.parse(await send(ws, "get_map"));
-    assert.notEqual(turned.data.theta, heading0, "rotate-left should change theta");
+    // 5. Function toggles (police is universal; the others are advisory but
+    //    every backend must at minimum return status:ok for the OFF variants)
+    for (const cmd of ["police", "policeOff",
+                       "automaticOff", "trackLineOff", "keepDistanceOff", "stopCV"]) {
+      assert.equal(JSON.parse(await send(ws, cmd)).status, "ok", `cmd ${cmd}`);
+    }
 
-    // 5. Stop mapping cleanly
-    assert.equal(JSON.parse(await send(ws, "mappingOff")).title, "mappingOff");
-    const final = JSON.parse(await send(ws, "get_map"));
-    assert.equal(final.data.mapping, false, "mappingOff should clear flag");
+    // 6. Servo calibration commands
+    for (const cmd of ["SiLeft 0", "SiRight 0", "PWMMS 0", "PWMINIT", "PWMD"]) {
+      assert.equal(JSON.parse(await send(ws, cmd)).status, "ok", `cmd ${cmd}`);
+    }
 
-    // 6. Movement stop commands
-    assert.equal(JSON.parse(await send(ws, "DS")).status, "ok");
-    assert.equal(JSON.parse(await send(ws, "TS")).status, "ok");
+    // 7. JSON payload (findColorSet)
+    const colorReply = JSON.parse(await send(ws, JSON.stringify({ title: "findColorSet", data: [120, 200, 200] })));
+    assert.equal(colorReply.status, "ok");
 
-    console.log(JSON.stringify({
-      ok: true,
-      backend_url: WS_URL,
-      grid_size: after.data.size,
-      pose_before: { x: before.data.x, y: before.data.y, theta: before.data.theta },
-      pose_after_forward: { x: after.data.x, y: after.data.y, theta: after.data.theta },
-      pose_after_rotate: { x: turned.data.x, y: turned.data.y, theta: turned.data.theta },
-      plan_length: plan.data.length,
-      coverage: after.data.coverage,
-      frontiers: after.data.frontiers,
-    }));
+    // ---------- SLAM extensions (Zig firmware + Node simulator only) ----------
+    if (INCLUDE_SLAM) {
+      assert.equal(JSON.parse(await send(ws, "slam_reset")).status, "ok");
+      const before = JSON.parse(await send(ws, "get_map"));
+      assert.equal(before.title, "get_map", "get_map title");
+      assert.ok(typeof before.data.grid === "string", "grid must be a string");
+      assert.equal(before.data.grid.length, before.data.size * before.data.size, "grid size mismatch");
+      assert.equal(before.data.mapping, false, "fresh state should not be mapping");
+
+      assert.equal(JSON.parse(await send(ws, "mapping")).title, "mapping");
+      for (let i = 0; i < 6; i++) await send(ws, "forward");
+      const after = JSON.parse(await send(ws, "get_map"));
+      assert.equal(after.title, "get_map");
+      assert.equal(after.data.mapping, true, "mapping flag should be true after `mapping`");
+      assert.ok(after.data.x >= before.data.x,
+        `pose_x should advance forward: before=${before.data.x} after=${after.data.x}`);
+
+      const plan = JSON.parse(await send(ws, "slam_plan 50 50"));
+      assert.equal(plan.title, "slam_plan");
+      assert.equal(typeof plan.data.found, "boolean");
+      assert.equal(typeof plan.data.length, "number");
+
+      const heading0 = after.data.theta;
+      for (let i = 0; i < 4; i++) await send(ws, "rotate-left");
+      const turned = JSON.parse(await send(ws, "get_map"));
+      assert.notEqual(turned.data.theta, heading0, "rotate-left should change theta");
+
+      assert.equal(JSON.parse(await send(ws, "mappingOff")).title, "mappingOff");
+      const final = JSON.parse(await send(ws, "get_map"));
+      assert.equal(final.data.mapping, false, "mappingOff should clear flag");
+
+      summary.slam = {
+        grid_size: after.data.size,
+        pose_advance: after.data.x - before.data.x,
+        plan_length: plan.data.length,
+        coverage: after.data.coverage,
+        frontiers: after.data.frontiers,
+        theta_changed: turned.data.theta !== heading0,
+      };
+    }
+
+    summary.ok = true;
+    console.log(JSON.stringify(summary));
   } finally {
     try { ws.close(); } catch {}
   }

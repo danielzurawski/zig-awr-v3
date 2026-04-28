@@ -1,0 +1,4 @@
+SCL = "SCL"
+SDA = "SDA"
+SPI = "SPI"
+SPI0 = "SPI0"

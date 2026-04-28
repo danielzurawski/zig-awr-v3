@@ -121,22 +121,32 @@ Both stacks share the I2C/GPIO peripherals on real hardware, so only one should 
 
 ## Functional acceptance test (Docker / Raspberry Pi OS)
 
-Use this when you cannot reach a real Pi but want empirical evidence that **install → run → control plane → protocol → uninstall** all work end-to-end.
+Use this when you cannot reach a real Pi but want empirical evidence that **install → run → control plane → protocol → coexistence → uninstall** all work end-to-end for **both** the vendor Python and the Zig firmware.
 
 ```bash
+# Optional: point at vendor V3 source (auto-detected from
+# ~/Downloads/Adeept_AWR-V3-*/Code/Adeept_AWR-V3 if not set)
+export VENDOR_SRC=/path/to/Adeept_AWR-V3
 bash zig-awr-v3/scripts/run-functional-acceptance.sh
 ```
 
 Expectations the agent should encode in any change:
 
-- The orchestrator (`scripts/acceptance/run-in-container.sh`) exits **non-zero** if any assertion fails, and the final line is **`PASS: <n>` / `FAIL: 0`**.
+- The orchestrator (`scripts/acceptance/run-in-container.sh`) exits **non-zero** if any assertion fails. The final line must be **`PASS: <n>` / `FAIL: 0`** — currently 88 / 0.
+- The suite is **dual-stack first**. Phases A–H exercise the Zig firmware in isolation. Phases I–M install and exercise the vendor Adeept Python firmware (`setup.py` + `WebServer.py`) on top of the Zig install, prove both run concurrently (vendor on `:8888`, Zig on `:8889`), prove `awr-stack` toggles cleanly with both present, and prove a full uninstall returns the system to a clean state. Treat any deviation in cross-stack coexistence — Zig clobbering vendor or vice versa — as a hard failure.
 - Each phase is **independent**: a phase failing must not silently invalidate later phases. `set -uo pipefail` (no `-e`) keeps the harness running so we get the full report.
-- The systemctl stub (`docker/stub-systemctl`) is the **only** authority that proves what `install-pi.sh` and `awr-stack` actually called. Add new control-plane assertions by `grep`-ing `/var/log/stub-systemctl.log`.
-- The black-box `scripts/acceptance/ws-protocol-test.mjs` runs against **both** the Zig binary (phases D, G) and—via the dashboard's own `npm run test:protocol`—against the Node simulator (phase F). Treat it as the cross-implementation parity contract: any new WebSocket command should add an assertion here AND in the dashboard's `tests/ws-protocol.test.mjs`.
-- Build the Zig binary with `--build-mode sim` in the container. The HAL must remain side-effect free in sim mode (no `/dev/gpiomem`, `/dev/i2c-1`, `/dev/spidev0.0` access) or the binary won't start under the Pi OS userspace running on Docker.
-- The acceptance run is **fast (~30 s on Apple Silicon)** because Docker layer-caches `apt`, Node, and the repo COPY. The Zig 0.14.1 download (`zig-aarch64-linux-0.14.1.tar.xz` — note the arch-os ordering, which changed at 0.14) is fetched fresh inside the container so `install-pi.sh`'s download path is exercised every run.
+- The systemctl stub (`docker/stub-systemctl`) is the **only** authority that proves what `install-pi.sh`, the vendor `setup.py`, and `awr-stack` actually called. Add new control-plane assertions by `grep`-ing `/var/log/stub-systemctl.log`.
+- The black-box `scripts/acceptance/ws-protocol-test.mjs` runs against **three** backends and asserts a different envelope per backend label:
+  - `BACKEND_LABEL=zig INCLUDE_SLAM=1` — Zig binary at `:8889` (full SLAM).
+  - `BACKEND_LABEL=vendor` — vendor Python `WebServer.py` at `:8888` (common subset, no SLAM, `get_info` length ≥ 3).
+  - dashboard `tests/ws-protocol.test.mjs` — Node simulator at `:8889` (with `/state` HTTP helpers).
 
-If a real Pi becomes available, the same install script runs unchanged: just drop `--build-mode sim` (defaults to `real`) and `awr-stack zig`.
+  Any new WebSocket command must land in **all three** if it's universal, or in the SLAM-gated branch only if it's a Zig-specific extension.
+- Build the Zig binary with `--build-mode sim`. The HAL must remain side-effect free in sim mode (no `/dev/gpiomem`, `/dev/i2c-1`, `/dev/spidev0.0` access) or the binary won't start under the Pi OS userspace running in Docker.
+- Vendor Python is run with hardware stubs in `docker/vendor_stubs/`. **Do not** add Python-side hardware imports to those stubs unless a vendor `WebServer.py` change requires it; the stubs exist purely to make the vendor's protocol code reachable in Docker, not to simulate hardware.
+- The acceptance run is ~100 s on Apple Silicon (Docker layer-caches `apt`, Node, Python, and the repo COPY; Zig 0.14.1 is fetched fresh inside the container — note `zig-aarch64-linux-0.14.1.tar.xz`, the arch-os ordering changed at 0.14).
+
+If a real Pi becomes available, the same install scripts run unchanged: just drop `--build-mode sim` (defaults to `real`), use the real vendor `setup.py` (no patching needed because the apt/pip/reboot lines are intentional on hardware), and `awr-stack zig` / `awr-stack python` to toggle live.
 
 ## Original Python Codebase Reference
 

@@ -23,6 +23,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # obviously about *script logic*, not network/apt flakiness.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates curl git tar xz-utils i2c-tools sudo \
+      python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Vendor Python firmware needs the websockets library on Bookworm we
+# install via apt to avoid PEP 668 friction; everything else the
+# vendor's WebServer.py touches is replaced by docker/vendor_stubs/.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-websockets \
     && rm -rf /var/lib/apt/lists/*
 
 # Node 22 (Raspberry Pi OS Bookworm ships Node 18 which is below the
@@ -39,11 +47,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 COPY zig-awr-v3/docker/stub-systemctl /usr/local/bin/systemctl
 RUN chmod +x /usr/local/bin/systemctl
 
-# Bring both repositories in. The dashboard side is optional — if it is
-# not present, the orchestrator's dashboard phase will skip itself.
+# Bring both repositories in plus, when present, the vendor Adeept
+# Python source. The dashboard and vendor sides are optional — if
+# either is missing, the orchestrator's corresponding phases self-skip.
 WORKDIR /opt/test
 COPY zig-awr-v3 /opt/test/zig-awr-v3
 COPY adeept-dashboard /opt/test/adeept-dashboard
+COPY adeept-vendor /opt/test/adeept-vendor
 
 # Avoid permission churn from `chown` calls inside the install script:
 # everything runs as root by default for a Docker-friendly install.
