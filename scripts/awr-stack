@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# awr-stack — toggle between the vendor Python firmware and the Zig firmware
+# on a Raspberry Pi running Adeept AWR-V3.
+#
+# Both stacks talk the same WebSocket protocol (auth admin:123456 by default),
+# the dashboard switches between them via the connection preset. Because they
+# both claim the same I2C/GPIO peripherals, only one should run at a time on
+# a real robot.
+#
+# Usage:
+#   awr-stack {python|zig|both|stop|status|logs-zig|logs-python}
+
+set -euo pipefail
+
+PYTHON_SVC="Adeept_Robot.service"
+ZIG_SVC="awr-v3-zig.service"
+
+SUDO=""
+if [ "$EUID" -ne 0 ]; then SUDO="sudo"; fi
+
+usage() {
+  cat <<EOF
+awr-stack — toggle vendor Python vs Zig AWR-V3 firmware
+
+Usage:
+  awr-stack python      Enable+start the vendor Python service (port 8888),
+                        stop+disable the Zig service.
+  awr-stack zig         Enable+start the Zig service (port 8889),
+                        stop+disable the vendor Python service.
+  awr-stack both        Enable+start BOTH (will compete for GPIO/I2C; only useful
+                        on a Pi without the HAT or for quick smoke tests).
+  awr-stack stop        Stop both services without changing enable state.
+  awr-stack status      Show enable/active state for both services.
+  awr-stack logs-zig    journalctl -fu awr-v3-zig.service
+  awr-stack logs-python journalctl -fu Adeept_Robot.service
+EOF
+}
+
+cmd() { echo "+ $*"; eval "$@"; }
+
+case "${1:-status}" in
+  python)
+    cmd "$SUDO systemctl stop $ZIG_SVC || true"
+    cmd "$SUDO systemctl disable $ZIG_SVC || true"
+    cmd "$SUDO systemctl enable --now $PYTHON_SVC"
+    ;;
+  zig)
+    cmd "$SUDO systemctl stop $PYTHON_SVC || true"
+    cmd "$SUDO systemctl disable $PYTHON_SVC || true"
+    cmd "$SUDO systemctl enable --now $ZIG_SVC"
+    ;;
+  both)
+    echo "WARNING: both services share GPIO/I2C. Expect failures on real HAT."
+    cmd "$SUDO systemctl enable --now $PYTHON_SVC || true"
+    cmd "$SUDO systemctl enable --now $ZIG_SVC || true"
+    ;;
+  stop)
+    cmd "$SUDO systemctl stop $PYTHON_SVC || true"
+    cmd "$SUDO systemctl stop $ZIG_SVC || true"
+    ;;
+  status)
+    for svc in $PYTHON_SVC $ZIG_SVC; do
+      echo "=== $svc ==="
+      printf 'enabled: '; systemctl is-enabled "$svc" 2>/dev/null || echo 'not installed'
+      printf 'active : '; systemctl is-active  "$svc" 2>/dev/null || echo 'inactive'
+      echo
+    done
+    ;;
+  logs-zig)    cmd "$SUDO journalctl -fu $ZIG_SVC";;
+  logs-python) cmd "$SUDO journalctl -fu $PYTHON_SVC";;
+  -h|--help|help) usage;;
+  *) echo "Unknown command: $1"; usage; exit 1;;
+esac

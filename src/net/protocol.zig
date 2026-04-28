@@ -88,6 +88,15 @@ pub fn isSpeedCmd(cmd: []const u8) bool {
     return std.mem.startsWith(u8, cmd, "wsB ");
 }
 
+pub fn isSlamCmd(cmd: []const u8) bool {
+    if (std.mem.eql(u8, cmd, "mapping")) return true;
+    if (std.mem.eql(u8, cmd, "mappingOff")) return true;
+    if (std.mem.eql(u8, cmd, "slam_reset")) return true;
+    if (std.mem.eql(u8, cmd, "get_map")) return true;
+    if (std.mem.startsWith(u8, cmd, "slam_plan ")) return true;
+    return false;
+}
+
 pub fn isJsonStr(data: []const u8) bool {
     if (data.len < 2) return false;
     return data[0] == '{' and data[data.len - 1] == '}';
@@ -127,4 +136,10 @@ test "command detection" {
     try std.testing.expect(isServoCmd("PWMINIT"));
     try std.testing.expect(isSpeedCmd("wsB 50"));
     try std.testing.expect(isJsonStr("{\"title\":\"test\"}"));
+    try std.testing.expect(isSlamCmd("mapping"));
+    try std.testing.expect(isSlamCmd("mappingOff"));
+    try std.testing.expect(isSlamCmd("slam_reset"));
+    try std.testing.expect(isSlamCmd("get_map"));
+    try std.testing.expect(isSlamCmd("slam_plan 50 50"));
+    try std.testing.expect(!isSlamCmd("slam"));
 }

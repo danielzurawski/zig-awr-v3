@@ -45,24 +45,39 @@ Command classification functions (`isMovementCmd`, `isStopCmd`, `isTiltCmd`, etc
 
 ### SLAM — `src/slam/`
 
-- **occupancy_grid.zig**: 80x80 grid using Bayesian log-odds. `updateCell()` adds LOG_ODDS_FREE (-0.4) or LOG_ODDS_OCC (+0.85), clamped to [-5, 5]. Cell state thresholds: <-0.5 = free, >0.5 = occupied, else unknown. `scanUltrasonic()` performs ray-casting. `countFrontiers()` finds unknown cells adjacent to free cells.
-- **path_planner.zig**: A* with Manhattan heuristic, fixed-size open list (2048 nodes), fixed-size closed/parent arrays (80x80). Returns path as a slice into a caller-provided buffer.
+- **occupancy_grid.zig**: 80x80 grid using Bayesian log-odds. `updateCell()` adds LOG_ODDS_FREE (-0.4) or LOG_ODDS_OCC (+0.85), clamped to [-5, 5]. Cell state thresholds: <-0.5 = free, >0.5 = occupied, else unknown. `scanUltrasonic(distance_cells, heading, endpoint_is_obstacle)` performs ray-casting along the **current pose heading**. The grid also owns the dead-reckoned pose (`pose_x`, `pose_y` as floats; `pose_theta_rad`). `applyTranslate(step_cm, direction)` and `applyRotate(delta_rad)` integrate movement commands. `encodeAscii()` serialises to `?`/`.`/`#` for streaming. `CELL_CM` = 10 (one cell per 10 cm).
+- **path_planner.zig**: A* with Manhattan heuristic, fixed-size open list (2048 nodes), fixed-size closed/parent arrays (80x80). Returns path as a slice into a caller-provided buffer. `Point` is `pub` so the WebSocket dispatcher can call `findPath` directly.
+
+### Live SLAM dispatch — `src/net/ws_server.zig`
+
+The WebSocket server runs a **single background mapping thread** (global `slam_thread` + `slam_stop`) that ticks every 250 ms while `robot.mapping` is true. Each tick reads the ultrasonic sensor and casts a ray on the occupancy grid using the current heading. Pose updates are applied **synchronously** when the standard `forward`/`backward`/`rotate-*` commands arrive, so the map reflects driver actions even when mapping is later toggled on. Protocol surface:
+
+- `mapping` → `startMappingThread`
+- `mappingOff` → `stopMappingThread` (joins the thread)
+- `slam_reset` → `OccupancyGrid.reset()` under `robot_mutex`
+- `get_map` → `formatGetMapResponse` writes `{title:"get_map", data:{size, cell_cm, x, y, theta, frontiers, coverage, mapping, grid}}`. Grid is encoded inline using `encodeAscii` to avoid an extra copy. The whole response is staged in an arena allocator so payloads can exceed the 4 KiB stack frame.
+- `slam_plan X Y` → calls `path_planner.findPath` from the current pose to the requested cell with a 2048-point buffer, returns `{found, length}`.
+
+Because `get_map` payloads can be 6.4 KiB+ (80×80 grid + envelope), `sendWsText` was rewritten to write a 2/4/10-byte WS header followed by the payload using two `writeAll` calls, removing the previous 4 KiB limit.
 
 ## Key Files
 
 | File | Purpose | Lines |
 |------|---------|-------|
-| `build.zig` | Build system with 11 feature toggles | ~61 |
-| `src/main.zig` | Entry point, RobotState definition | ~105 |
-| `src/hal.zig` | HAL with Sim + Linux backends | ~387 |
-| `src/net/ws_server.zig` | WebSocket server, full protocol dispatch | ~420 |
-| `src/net/protocol.zig` | Command classification, JSON formatting | ~112 |
+| `build.zig` | Build system with 11 feature toggles | ~80 |
+| `src/main.zig` | Entry point, RobotState definition (incl. `mapping` flag) | ~110 |
+| `src/hal.zig` | HAL with Sim + Linux backends (`/dev/gpiomem`) | ~387 |
+| `src/net/ws_server.zig` | WebSocket server + SLAM dispatch + mapping thread | ~580 |
+| `src/net/protocol.zig` | Command classification (incl. `isSlamCmd`), JSON formatting | ~135 |
 | `src/motor/driver.zig` | 4-motor PCA9685 driver | ~132 |
 | `src/servo/controller.zig` | 8-channel servo controller | ~138 |
 | `src/led/ws2812.zig` | WS2812 SPI driver + 4 effects | ~222 |
-| `src/slam/occupancy_grid.zig` | Bayesian occupancy grid | ~146 |
-| `src/slam/path_planner.zig` | A* pathfinding | ~187 |
+| `src/slam/occupancy_grid.zig` | Bayesian occupancy grid + pose tracking + ASCII encoder | ~190 |
+| `src/slam/path_planner.zig` | A* pathfinding (with `pub Point`) | ~190 |
 | `src/audio/buzzer.zig` | 14-note buzzer with GPIO PWM | ~142 |
+| `scripts/install-pi.sh` | One-shot Pi installer (Zig + service + helper) | ~150 |
+| `scripts/awr-stack` | Toggle helper between vendor Python and Zig services | ~80 |
+| `scripts/uninstall-pi.sh` | Removes Zig stack only | ~25 |
 
 ## Build Commands
 
@@ -86,8 +101,23 @@ zig build -Dsim=false -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast  # Cross
 
 ## Companion Projects
 
-- **`adeept-dashboard`**: React cockpit that connects over WebSocket only. It includes a **Node** `ws-server.mjs` simulator and `npm run test:protocol`, which exercise the AWR-V3 command contract. Run Zig or Python robot firmware on the Pi; run the dashboard on a development machine on the same LAN.
-- **Original Python firmware** (`Adeept_AWR-V3/Server/…`): reference implementation; often `ws://<pi>:8888`, Flask camera on `http://<pi>:5000`.
+- **`adeept-dashboard`**: React cockpit that connects over WebSocket only. It includes a **Node** `ws-server.mjs` simulator and `npm run test:protocol`, which exercise the AWR-V3 command contract (including the SLAM track). Run Zig or Python robot firmware on the Pi; run the dashboard on a development machine on the same LAN.
+- **Original Python firmware** (`Adeept_AWR-V3/Server/…`): reference implementation; often `ws://<pi>:8888`, Flask camera on `http://<pi>:5000`. Coexists with this stack via `awr-stack`.
+
+## Pi installation & coexistence
+
+`scripts/install-pi.sh` is the equivalent of the vendor `setup.py`. It is **additive** — it never disables or rewrites `Adeept_Robot.service`. It installs Zig 0.14.x, copies the repo to `/opt/awr-v3-zig`, builds the binary, drops `/etc/awr-v3-zig/credentials.env` (chmod 600), and registers `awr-v3-zig.service` (DISABLED on first install).
+
+`scripts/awr-stack` is a tiny systemd wrapper:
+
+- `awr-stack zig` → stop+disable vendor, enable+start Zig
+- `awr-stack python` → stop+disable Zig, enable+start vendor
+- `awr-stack both` → enable both (warns about GPIO/I2C contention)
+- `awr-stack stop` → stop both
+- `awr-stack status` → enable + active state for both
+- `awr-stack logs-zig` / `logs-python` → `journalctl -fu …`
+
+Both stacks share the I2C/GPIO peripherals on real hardware, so only one should run at a time on the HAT. Use the dashboard's connection presets (`Python robot` vs `Zig robot`) to point at whichever is active.
 
 ## Original Python Codebase Reference
 
@@ -112,6 +142,6 @@ This firmware reimplements the protocol from these original Python files:
 ## Future Work
 
 - **Camera/vision**: Implement V4L2 capture and MJPEG streaming. The original uses picamera2 + OpenCV; the Zig equivalent would use V4L2 ioctl + manual JPEG encoding or link against libjpeg.
-- **Autonomous behaviors**: `Functions.py` obstacle avoidance, line tracking, and keep-distance loops are represented as state flags but the actual control loops are not yet implemented.
-- **SLAM integration**: The occupancy grid and path planner exist but are not wired to the ultrasonic sensor or WebSocket for real-time mapping.
-- **Occupancy grid serialization**: Export/import grid state for persistence or WebSocket streaming to the dashboard.
+- **Autonomous behaviors**: `Functions.py` obstacle avoidance, line tracking, and keep-distance loops are represented as state flags but the actual control loops are not yet implemented in Zig.
+- **Wheel encoders / IMU**: Pose is currently dead-reckoned from movement commands. Adding an MPU6050 or wheel encoders would significantly improve the live SLAM map fidelity.
+- **Path execution**: `slam_plan` returns a length but the firmware does not yet drive along the returned path. A safe execution mode (with sonar-aware abort) is the next step.

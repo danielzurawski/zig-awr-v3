@@ -9,10 +9,19 @@ const LOG_ODDS_MIN: f32 = -5.0;
 
 pub const CellState = enum(u2) { unknown = 0, free = 1, occupied = 2 };
 
+/// Real-world width (in cm) covered by one occupancy cell. With GRID_SIZE=80
+/// and 10 cm per cell, the grid covers an 8 m × 8 m area. Adjust if you change
+/// the robot footprint or the room size.
+pub const CELL_CM: f32 = 10.0;
+
 pub const OccupancyGrid = struct {
     cells: [GRID_SIZE][GRID_SIZE]f32 = undefined,
-    robot_x: i32 = @as(i32, GRID_SIZE / 2),
-    robot_y: i32 = @as(i32, GRID_SIZE / 2),
+    /// Sub-cell pose in continuous (cell) coordinates so dead-reckoning does
+    /// not lose information across many small movements.
+    pose_x: f32 = @as(f32, GRID_SIZE / 2),
+    pose_y: f32 = @as(f32, GRID_SIZE / 2),
+    /// Heading in radians: 0 points along +x ("east"), pi/2 along +y ("north").
+    pose_theta_rad: f32 = 0.0,
     cells_explored: u32 = 0,
 
     pub fn init() OccupancyGrid {
@@ -27,9 +36,38 @@ pub const OccupancyGrid = struct {
                 self.cells[y][x] = LOG_ODDS_PRIOR;
             }
         }
-        self.robot_x = @as(i32, GRID_SIZE / 2);
-        self.robot_y = @as(i32, GRID_SIZE / 2);
+        self.pose_x = @as(f32, GRID_SIZE / 2);
+        self.pose_y = @as(f32, GRID_SIZE / 2);
+        self.pose_theta_rad = 0.0;
         self.cells_explored = 0;
+    }
+
+    pub fn robotCellX(self: *const OccupancyGrid) i32 {
+        return @intFromFloat(std.math.clamp(self.pose_x, 0.0, @as(f32, GRID_SIZE - 1)));
+    }
+
+    pub fn robotCellY(self: *const OccupancyGrid) i32 {
+        return @intFromFloat(std.math.clamp(self.pose_y, 0.0, @as(f32, GRID_SIZE - 1)));
+    }
+
+    /// Apply a rotation update (positive = counterclockwise/left).
+    pub fn applyRotate(self: *OccupancyGrid, delta_rad: f32) void {
+        var t = self.pose_theta_rad + delta_rad;
+        const tau = std.math.pi * 2.0;
+        while (t > std.math.pi) t -= tau;
+        while (t < -std.math.pi) t += tau;
+        self.pose_theta_rad = t;
+    }
+
+    /// Advance the robot pose by `step_cm` along its current heading.
+    /// `direction` should be +1 for forward, -1 for backward.
+    pub fn applyTranslate(self: *OccupancyGrid, step_cm: f32, direction: i8) void {
+        const cells = step_cm / CELL_CM;
+        const dirf: f32 = @floatFromInt(direction);
+        const dx = @cos(self.pose_theta_rad) * cells * dirf;
+        const dy = @sin(self.pose_theta_rad) * cells * dirf;
+        self.pose_x = std.math.clamp(self.pose_x + dx, 0.0, @as(f32, GRID_SIZE - 1));
+        self.pose_y = std.math.clamp(self.pose_y + dy, 0.0, @as(f32, GRID_SIZE - 1));
     }
 
     pub fn getState(self: *const OccupancyGrid, x: usize, y: usize) CellState {
@@ -57,27 +95,38 @@ pub const OccupancyGrid = struct {
         }
     }
 
-    /// Simulate an ultrasonic scan from robot position with given heading
-    pub fn scanUltrasonic(self: *OccupancyGrid, distance_cells: u32, heading_rad: f32) void {
+    /// Cast an ultrasonic ray from the robot pose along `heading_rad` and
+    /// integrate `distance_cells` cells of free space, marking the endpoint
+    /// as occupied if `endpoint_is_obstacle` is true (i.e. the sensor saw a
+    /// real reflection rather than timing out at max range).
+    pub fn scanUltrasonic(
+        self: *OccupancyGrid,
+        distance_cells: u32,
+        heading_rad: f32,
+        endpoint_is_obstacle: bool,
+    ) void {
         const cos_h = @cos(heading_rad);
         const sin_h = @sin(heading_rad);
 
         var i: u32 = 0;
         while (i < distance_cells) : (i += 1) {
-            const fx: f32 = @as(f32, @floatFromInt(self.robot_x)) + @as(f32, @floatFromInt(i)) * cos_h;
-            const fy: f32 = @as(f32, @floatFromInt(self.robot_y)) + @as(f32, @floatFromInt(i)) * sin_h;
+            const fi: f32 = @floatFromInt(i);
+            const fx: f32 = self.pose_x + fi * cos_h;
+            const fy: f32 = self.pose_y + fi * sin_h;
             const cx: i32 = @intFromFloat(fx);
             const cy: i32 = @intFromFloat(fy);
             if (cx < 0 or cy < 0 or cx >= GRID_SIZE or cy >= GRID_SIZE) break;
-            self.updateCell(@intCast(cx), @intCast(cy), false); // Free space along ray
+            self.updateCell(@intCast(cx), @intCast(cy), false);
         }
-        // Mark the endpoint as occupied
-        const ex: f32 = @as(f32, @floatFromInt(self.robot_x)) + @as(f32, @floatFromInt(distance_cells)) * cos_h;
-        const ey: f32 = @as(f32, @floatFromInt(self.robot_y)) + @as(f32, @floatFromInt(distance_cells)) * sin_h;
-        const ecx: i32 = @intFromFloat(ex);
-        const ecy: i32 = @intFromFloat(ey);
-        if (ecx >= 0 and ecy >= 0 and ecx < GRID_SIZE and ecy < GRID_SIZE) {
-            self.updateCell(@intCast(ecx), @intCast(ecy), true);
+        if (endpoint_is_obstacle) {
+            const fd: f32 = @floatFromInt(distance_cells);
+            const ex: f32 = self.pose_x + fd * cos_h;
+            const ey: f32 = self.pose_y + fd * sin_h;
+            const ecx: i32 = @intFromFloat(ex);
+            const ecy: i32 = @intFromFloat(ey);
+            if (ecx >= 0 and ecy >= 0 and ecx < GRID_SIZE and ecy < GRID_SIZE) {
+                self.updateCell(@intCast(ecx), @intCast(ecy), true);
+            }
         }
     }
 
@@ -101,15 +150,32 @@ pub const OccupancyGrid = struct {
         return count;
     }
 
-    pub fn moveRobot(self: *OccupancyGrid, dx: i32, dy: i32) void {
-        self.robot_x = std.math.clamp(self.robot_x + dx, 0, @as(i32, GRID_SIZE - 1));
-        self.robot_y = std.math.clamp(self.robot_y + dy, 0, @as(i32, GRID_SIZE - 1));
-    }
-
     pub fn coveragePercent(self: *const OccupancyGrid) u8 {
         const total: f32 = @floatFromInt(GRID_SIZE * GRID_SIZE);
         const explored: f32 = @floatFromInt(self.cells_explored);
         return @intFromFloat(std.math.clamp(explored / total * 100.0, 0.0, 100.0));
+    }
+
+    /// Encode the grid as a compact ASCII string (one char per cell, row-major)
+    /// suitable for streaming over the WebSocket protocol.
+    /// `?` = unknown, `.` = free, `#` = occupied.
+    pub fn encodeAscii(self: *const OccupancyGrid, out: []u8) []u8 {
+        const need = GRID_SIZE * GRID_SIZE;
+        const limit = if (out.len < need) out.len else need;
+        var idx: usize = 0;
+        for (0..GRID_SIZE) |y| {
+            for (0..GRID_SIZE) |x| {
+                if (idx >= limit) break;
+                const c = switch (self.getState(x, y)) {
+                    .unknown => @as(u8, '?'),
+                    .free => @as(u8, '.'),
+                    .occupied => @as(u8, '#'),
+                };
+                out[idx] = c;
+                idx += 1;
+            }
+        }
+        return out[0..idx];
     }
 };
 
@@ -126,14 +192,36 @@ test "OccupancyGrid init and update" {
     try std.testing.expectEqual(CellState.free, grid.getState(10, 10));
 }
 
-test "OccupancyGrid scan" {
+test "OccupancyGrid scan along heading" {
     var grid = OccupancyGrid.init();
-    grid.robot_x = 40;
-    grid.robot_y = 40;
-    grid.scanUltrasonic(10, 0.0);
-    grid.scanUltrasonic(10, 0.0);
+    grid.pose_x = 40.0;
+    grid.pose_y = 40.0;
+    grid.pose_theta_rad = 0.0;
+    grid.scanUltrasonic(10, 0.0, true);
+    grid.scanUltrasonic(10, 0.0, true);
     try std.testing.expectEqual(CellState.free, grid.getState(45, 40));
     try std.testing.expectEqual(CellState.occupied, grid.getState(50, 40));
+}
+
+test "OccupancyGrid pose updates" {
+    var grid = OccupancyGrid.init();
+    const start_x = grid.pose_x;
+    grid.applyTranslate(20.0, 1);
+    try std.testing.expect(grid.pose_x > start_x);
+    grid.applyRotate(std.math.pi / 2.0);
+    try std.testing.expect(grid.pose_theta_rad > 1.0);
+}
+
+test "OccupancyGrid encodeAscii" {
+    var grid = OccupancyGrid.init();
+    grid.updateCell(0, 0, false);
+    grid.updateCell(0, 0, false);
+    grid.updateCell(1, 0, true);
+    grid.updateCell(1, 0, true);
+    var buf: [GRID_SIZE * GRID_SIZE]u8 = undefined;
+    const enc = grid.encodeAscii(&buf);
+    try std.testing.expectEqual(@as(u8, '.'), enc[0]);
+    try std.testing.expectEqual(@as(u8, '#'), enc[1]);
 }
 
 test "OccupancyGrid coverage" {

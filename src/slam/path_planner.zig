@@ -1,7 +1,7 @@
 const std = @import("std");
 const grid_mod = @import("occupancy_grid.zig");
 
-const Point = struct { x: i32, y: i32 };
+pub const Point = struct { x: i32, y: i32 };
 
 const Node = struct {
     pos: Point,

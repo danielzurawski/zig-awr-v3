@@ -21,6 +21,8 @@ pub const RobotState = struct {
     functions: FunctionState = .{},
     switches: [3]bool = .{ false, false, false },
     servo_pwm: [5]u8 = .{ 90, 90, 90, 90, 90 },
+    /// True while the background SLAM mapping thread is active.
+    mapping: bool = false,
     hal_ctx: *hal.HalContext,
     motor: if (cfg.motor) motor_mod.MotorDriver else void,
     servo: if (cfg.servo) servo_mod.ServoController else void,

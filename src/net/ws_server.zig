@@ -2,11 +2,27 @@ const std = @import("std");
 const cfg = @import("config");
 const protocol = @import("protocol.zig");
 const main_mod = @import("../main.zig");
+const grid_mod = @import("../slam/occupancy_grid.zig");
+const path_planner = @import("../slam/path_planner.zig");
 
 var auth_user_buf: [64]u8 = undefined;
 var auth_pass_buf: [64]u8 = undefined;
 var auth_user: []const u8 = "";
 var auth_pass: []const u8 = "";
+
+// ── SLAM mapping thread state ────────────────────────────────────────
+// Single global thread is fine: only one mapping loop should ever run
+// because it owns exclusive access to the ultrasonic sensor.
+var slam_thread: ?std.Thread = null;
+var slam_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Approximate cm advanced per forward/backward command tick. Used for
+/// dead-reckoning the robot pose on the occupancy grid. Conservative —
+/// real travel depends on speed and tick duration, but this gives a
+/// usable map without requiring wheel encoders.
+const STEP_CM_PER_MOVE: f32 = 4.0;
+/// Heading delta (radians) per rotate-left / rotate-right command.
+const ROT_RAD_PER_TURN: f32 = 0.262; // ~15 degrees
 
 fn loadCredentials() void {
     if (std.posix.getenv("AWR_WS_USER")) |user| {
@@ -130,6 +146,17 @@ fn handleConnection(conn: std.net.Stream, robot: *main_mod.RobotState) void {
                     const dir: i8 = if (std.mem.eql(u8, msg, "backward")) -1 else 1;
                     robot.motor.move(robot.speed, dir, turn);
                 }
+                if (cfg.slam) {
+                    if (std.mem.eql(u8, msg, "forward")) {
+                        robot.slam_grid.applyTranslate(STEP_CM_PER_MOVE, 1);
+                    } else if (std.mem.eql(u8, msg, "backward")) {
+                        robot.slam_grid.applyTranslate(STEP_CM_PER_MOVE, -1);
+                    } else if (std.mem.eql(u8, msg, "rotate-left") or std.mem.eql(u8, msg, "left")) {
+                        robot.slam_grid.applyRotate(ROT_RAD_PER_TURN);
+                    } else if (std.mem.eql(u8, msg, "rotate-right") or std.mem.eql(u8, msg, "right")) {
+                        robot.slam_grid.applyRotate(-ROT_RAD_PER_TURN);
+                    }
+                }
             }
             const out = protocol.formatResponse(&resp_buf, .{}) catch continue;
             sendWsText(conn, out) catch break;
@@ -239,6 +266,11 @@ fn handleConnection(conn: std.net.Stream, robot: *main_mod.RobotState) void {
             continue;
         }
 
+        if (cfg.slam and protocol.isSlamCmd(msg)) {
+            handleSlam(conn, msg, robot) catch break;
+            continue;
+        }
+
         if (protocol.isJsonStr(msg)) {
             const out = protocol.formatResponse(&resp_buf, .{}) catch continue;
             sendWsText(conn, out) catch break;
@@ -248,6 +280,158 @@ fn handleConnection(conn: std.net.Stream, robot: *main_mod.RobotState) void {
         const out = protocol.formatResponse(&resp_buf, .{}) catch continue;
         sendWsText(conn, out) catch break;
     }
+}
+
+// ── SLAM handlers ────────────────────────────────────────────────────
+
+fn handleSlam(conn: std.net.Stream, msg: []const u8, robot: *main_mod.RobotState) !void {
+    if (!cfg.slam) return;
+    if (std.mem.eql(u8, msg, "mapping")) {
+        startMappingThread(robot);
+        var resp_buf: [256]u8 = undefined;
+        const out = try protocol.formatResponse(&resp_buf, .{ .title = "mapping" });
+        try sendWsText(conn, out);
+        return;
+    }
+    if (std.mem.eql(u8, msg, "mappingOff")) {
+        stopMappingThread(robot);
+        var resp_buf: [256]u8 = undefined;
+        const out = try protocol.formatResponse(&resp_buf, .{ .title = "mappingOff" });
+        try sendWsText(conn, out);
+        return;
+    }
+    if (std.mem.eql(u8, msg, "slam_reset")) {
+        {
+            robot_mutex.lock();
+            defer robot_mutex.unlock();
+            robot.slam_grid.reset();
+        }
+        var resp_buf: [256]u8 = undefined;
+        const out = try protocol.formatResponse(&resp_buf, .{ .title = "slam_reset" });
+        try sendWsText(conn, out);
+        return;
+    }
+    if (std.mem.eql(u8, msg, "get_map")) {
+        // Format the response into a heap buffer so we can stream the full
+        // ASCII grid (GRID_SIZE * GRID_SIZE chars) plus JSON envelope.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const cap = grid_mod.GRID_SIZE * grid_mod.GRID_SIZE + 512;
+        const buf = a.alloc(u8, cap) catch return;
+        const written = blk: {
+            robot_mutex.lock();
+            defer robot_mutex.unlock();
+            break :blk formatGetMapResponse(buf, &robot.slam_grid, robot.mapping) catch break :blk null;
+        };
+        if (written) |w| try sendWsText(conn, w);
+        return;
+    }
+    if (std.mem.startsWith(u8, msg, "slam_plan ")) {
+        const args = msg[10..];
+        var iter = std.mem.tokenizeScalar(u8, args, ' ');
+        const tx_str = iter.next() orelse return;
+        const ty_str = iter.next() orelse return;
+        const tx = std.fmt.parseInt(i32, tx_str, 10) catch return;
+        const ty = std.fmt.parseInt(i32, ty_str, 10) catch return;
+        var path_buf: [2048]path_planner.Point = undefined;
+        const result = blk: {
+            robot_mutex.lock();
+            defer robot_mutex.unlock();
+            const start = path_planner.Point{
+                .x = robot.slam_grid.robotCellX(),
+                .y = robot.slam_grid.robotCellY(),
+            };
+            const goal = path_planner.Point{
+                .x = std.math.clamp(tx, 0, @as(i32, grid_mod.GRID_SIZE - 1)),
+                .y = std.math.clamp(ty, 0, @as(i32, grid_mod.GRID_SIZE - 1)),
+            };
+            break :blk path_planner.findPath(&robot.slam_grid, start, goal, &path_buf);
+        };
+        var out_buf: [512]u8 = undefined;
+        const out = try formatPlanResponse(&out_buf, result);
+        try sendWsText(conn, out);
+        return;
+    }
+}
+
+fn startMappingThread(robot: *main_mod.RobotState) void {
+    {
+        robot_mutex.lock();
+        defer robot_mutex.unlock();
+        if (robot.mapping) return;
+        robot.mapping = true;
+    }
+    slam_stop.store(false, .release);
+    slam_thread = std.Thread.spawn(.{}, slamMappingLoop, .{robot}) catch null;
+}
+
+fn stopMappingThread(robot: *main_mod.RobotState) void {
+    {
+        robot_mutex.lock();
+        defer robot_mutex.unlock();
+        if (!robot.mapping) return;
+        robot.mapping = false;
+    }
+    slam_stop.store(true, .release);
+    if (slam_thread) |t| {
+        t.join();
+        slam_thread = null;
+    }
+}
+
+fn slamMappingLoop(robot: *main_mod.RobotState) void {
+    while (!slam_stop.load(.acquire)) {
+        {
+            robot_mutex.lock();
+            defer robot_mutex.unlock();
+            if (cfg.slam and cfg.ultrasonic) {
+                const distance_cm = robot.ultrasonic.readDistance();
+                const cells_f = distance_cm / grid_mod.CELL_CM;
+                var cells: u32 = 0;
+                if (cells_f > 0.0) cells = @intFromFloat(cells_f);
+                const max_cells: u32 = grid_mod.GRID_SIZE - 1;
+                const clamped = if (cells > max_cells) max_cells else cells;
+                const obstacle_seen = distance_cm < 195.0;
+                robot.slam_grid.scanUltrasonic(clamped, robot.slam_grid.pose_theta_rad, obstacle_seen);
+            }
+        }
+        std.time.sleep(250_000_000);
+    }
+}
+
+fn formatGetMapResponse(buf: []u8, grid: *const grid_mod.OccupancyGrid, mapping_active: bool) ![]u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    const w = stream.writer();
+    try w.writeAll("{\"status\":\"ok\",\"title\":\"get_map\",\"data\":{");
+    try w.print("\"size\":{d},", .{grid_mod.GRID_SIZE});
+    try w.print("\"cell_cm\":{d:.1},", .{grid_mod.CELL_CM});
+    try w.print("\"x\":{d},", .{grid.robotCellX()});
+    try w.print("\"y\":{d},", .{grid.robotCellY()});
+    try w.print("\"theta\":{d:.4},", .{grid.pose_theta_rad});
+    try w.print("\"frontiers\":{d},", .{grid.countFrontiers()});
+    try w.print("\"coverage\":{d},", .{grid.coveragePercent()});
+    try w.print("\"mapping\":{s},", .{if (mapping_active) "true" else "false"});
+    try w.writeAll("\"grid\":\"");
+    // Encode grid directly into the response buffer to avoid an extra copy.
+    const encode_buf = buf[stream.pos .. stream.pos + grid_mod.GRID_SIZE * grid_mod.GRID_SIZE];
+    const enc = grid.encodeAscii(encode_buf);
+    stream.pos += enc.len;
+    try w.writeAll("\"}}");
+    return stream.getWritten();
+}
+
+fn formatPlanResponse(buf: []u8, path: ?[]path_planner.Point) ![]u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    const w = stream.writer();
+    try w.writeAll("{\"status\":\"ok\",\"title\":\"slam_plan\",\"data\":{");
+    if (path) |p| {
+        try w.print("\"found\":true,\"length\":{d}", .{p.len});
+    } else {
+        try w.writeAll("\"found\":false,\"length\":0");
+    }
+    try w.writeAll("}}");
+    return stream.getWritten();
 }
 
 fn dispatchFunction(cmd: []const u8, robot: *main_mod.RobotState) void {
@@ -462,20 +646,23 @@ fn readWsFrame(conn: std.net.Stream, buf: []u8) ![]u8 {
 }
 
 fn sendWsText(conn: std.net.Stream, data: []const u8) !void {
-    var frame: [4096 + 10]u8 = undefined;
-    var pos: usize = 0;
-    frame[0] = 0x81;
-    pos = 1;
+    var hdr: [10]u8 = undefined;
+    hdr[0] = 0x81;
+    var hdr_len: usize = 0;
     if (data.len < 126) {
-        frame[1] = @intCast(data.len);
-        pos = 2;
+        hdr[1] = @intCast(data.len);
+        hdr_len = 2;
     } else if (data.len < 65536) {
-        frame[1] = 126;
-        std.mem.writeInt(u16, frame[2..4], @intCast(data.len), .big);
-        pos = 4;
-    } else return error.PayloadTooLarge;
-    @memcpy(frame[pos .. pos + data.len], data);
-    try conn.writeAll(frame[0 .. pos + data.len]);
+        hdr[1] = 126;
+        std.mem.writeInt(u16, hdr[2..4], @intCast(data.len), .big);
+        hdr_len = 4;
+    } else {
+        hdr[1] = 127;
+        std.mem.writeInt(u64, hdr[2..10], data.len, .big);
+        hdr_len = 10;
+    }
+    try conn.writeAll(hdr[0..hdr_len]);
+    try conn.writeAll(data);
 }
 
 pub fn run(allocator: std.mem.Allocator, robot: *main_mod.RobotState, port: u16) !void {
@@ -507,4 +694,24 @@ test "protocol integration" {
     const resp = protocol.Response{};
     const out = try protocol.formatResponse(&buf, resp);
     try std.testing.expect(out.len > 0);
+}
+
+test "SLAM get_map response carries grid envelope" {
+    if (!cfg.slam) return;
+    var grid = grid_mod.OccupancyGrid.init();
+    grid.updateCell(40, 40, false);
+    grid.updateCell(40, 40, false);
+    var buf: [grid_mod.GRID_SIZE * grid_mod.GRID_SIZE + 512]u8 = undefined;
+    const out = try formatGetMapResponse(&buf, &grid, true);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"title\":\"get_map\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"size\":80") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"mapping\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"grid\":\"") != null);
+}
+
+test "SLAM slam_plan response with no path" {
+    var buf: [256]u8 = undefined;
+    const out = try formatPlanResponse(&buf, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"found\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"length\":0") != null);
 }

@@ -26,9 +26,9 @@ The original AWR-V3 firmware is Python with 15+ pip dependencies, consuming ~200
 - **WS2812 LED driver** — SPI bit-encoded protocol with breath, police, rainbow, and flowing effects
 - **Buzzer** — 14-note frequency table with GPIO PWM tone generation
 - **PID controller** and **Kalman filter**
-- **SLAM occupancy grid** — 80x80 Bayesian log-odds grid with frontier detection
-- **A\* path planner** — operates on the occupancy grid
-- **WebSocket server** — raw TCP with RFC 6455 framing, mutex-synchronized state, environment-based credentials
+- **Live SLAM** — 80x80 Bayesian log-odds occupancy grid fed by the ultrasonic sensor in a background thread, with dead-reckoned pose updated by movement commands and exposed over the WebSocket protocol
+- **A\* path planner** — operates on the live occupancy grid, exposed via `slam_plan X Y`
+- **WebSocket server** — raw TCP with RFC 6455 framing, mutex-synchronized state, environment-based credentials, supports SLAM streaming (`mapping`, `mappingOff`, `slam_reset`, `get_map`, `slam_plan`)
 
 ## Prerequisites
 
@@ -115,8 +115,12 @@ zig-awr-v3/
 │   │   ├── occupancy_grid.zig         # 80x80 Bayesian log-odds grid
 │   │   └── path_planner.zig           # A* pathfinding
 │   └── net/
-│       ├── ws_server.zig              # WebSocket server (raw TCP + RFC 6455)
+│       ├── ws_server.zig              # WebSocket server (raw TCP + RFC 6455) + live SLAM dispatch
 │       └── protocol.zig               # Command parser + JSON response builder
+└── scripts/
+    ├── install-pi.sh                  # One-shot Pi installer (Zig + service + helper)
+    ├── uninstall-pi.sh                # Removes the Zig stack only (vendor stack untouched)
+    └── awr-stack                      # Toggle helper for vendor Python vs Zig services
 ```
 
 ## WebSocket Protocol
@@ -129,6 +133,44 @@ export AWR_WS_PASS=123456
 ```
 
 All commands from the original protocol are supported: movement, camera tilt, speed, function toggles, switch control, servo calibration, JSON payloads, and `get_info` telemetry.
+
+### Live SLAM commands
+
+The Zig firmware adds a small SLAM extension on top of the vendor protocol:
+
+| Command | Effect | Response shape |
+|---|---|---|
+| `mapping` | Spawn the background mapping thread (250 ms ultrasonic ticks). | `{title:"mapping"}` |
+| `mappingOff` | Stop the mapping thread. | `{title:"mappingOff"}` |
+| `slam_reset` | Clear the grid and reset pose to the centre. | `{title:"slam_reset"}` |
+| `get_map` | Return current pose, frontiers, coverage, and an ASCII grid (`?` unknown, `.` free, `#` occupied). | `{title:"get_map", data:{size, cell_cm, x, y, theta, frontiers, coverage, mapping, grid}}` |
+| `slam_plan X Y` | Run A\* from current pose to `(X,Y)` cell, returning path length. | `{title:"slam_plan", data:{found, length}}` |
+
+Pose is dead-reckoned: `forward`/`backward` advance the pose by `STEP_CM_PER_MOVE` cm along the heading, and `rotate-*` adjust the heading by ~15°. Without wheel encoders the map will drift over long runs, but it is sufficient for a live demo and frontier visualisation.
+
+## One-shot Pi installer
+
+`scripts/install-pi.sh` is the equivalent of the vendor `setup.py` for this stack. It installs Zig 0.14.x, builds the binary, and registers a systemd unit (DISABLED by default so it does not fight the vendor service):
+
+```bash
+git clone https://github.com/danielzurawski/zig-awr-v3.git
+cd zig-awr-v3
+sudo bash scripts/install-pi.sh         # full install, leaves Adeept_Robot.service alone
+sudo bash scripts/install-pi.sh --dry-run   # print every step without running it
+```
+
+Once installed, the `awr-stack` helper toggles between the vendor Python firmware and this Zig firmware:
+
+```bash
+awr-stack status     # show enable/active state for both services
+awr-stack zig        # stop+disable Adeept_Robot.service, enable+start awr-v3-zig.service
+awr-stack python     # the inverse: switch back to the vendor stack
+awr-stack stop       # stop both for manual scripting / examples
+```
+
+Both services share the same I2C/GPIO peripherals on real hardware, so only one should run at a time. The dashboard already includes presets for `ws://raspberry-pi.local:8888` (Python) and `ws://raspberry-pi.local:8889` (Zig) — switch the active stack on the Pi, then re-connect from the dashboard.
+
+To uninstall the Zig stack (without touching the vendor stack): `sudo bash scripts/uninstall-pi.sh`.
 
 ## Hardware
 
