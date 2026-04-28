@@ -52,9 +52,23 @@ pub fn isTiltCmd(cmd: []const u8) bool {
 
 pub fn isFunctionCmd(cmd: []const u8) bool {
     const cmds = [_][]const u8{
-        "findColor", "motionGet", "stopCV", "automatic", "automaticOff",
-        "trackLine", "trackLineOff", "police",  "policeOff",
-        "keepDistance", "keepDistanceOff", "CVFL",
+        "findColor",       "motionGet",    "stopCV", "automatic", "automaticOff",
+        "trackLine",       "trackLineOff", "police", "policeOff", "keepDistance",
+        "keepDistanceOff", "CVFL",
+    };
+    for (cmds) |c| {
+        if (std.mem.eql(u8, cmd, c)) return true;
+    }
+    return false;
+}
+
+pub fn isAudioCmd(cmd: []const u8) bool {
+    return std.mem.startsWith(u8, cmd, "tone ") or std.mem.startsWith(u8, cmd, "tune ");
+}
+
+pub fn isLightEffectCmd(cmd: []const u8) bool {
+    const cmds = [_][]const u8{
+        "lights_breath_blue", "lights_rainbow", "lights_flowing", "lights_off",
     };
     for (cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
@@ -105,6 +119,9 @@ test "command detection" {
     try std.testing.expect(isStopCmd("DS"));
     try std.testing.expect(isTiltCmd("up"));
     try std.testing.expect(isFunctionCmd("findColor"));
+    try std.testing.expect(isAudioCmd("tone C5 160"));
+    try std.testing.expect(isAudioCmd("tune baby_shark"));
+    try std.testing.expect(isLightEffectCmd("lights_rainbow"));
     try std.testing.expect(isSwitchCmd("Switch_1_on"));
     try std.testing.expect(isServoCmd("SiLeft 0"));
     try std.testing.expect(isServoCmd("PWMINIT"));

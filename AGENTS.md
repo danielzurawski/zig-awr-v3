@@ -25,10 +25,7 @@ When a feature flag is `false`, the field becomes `void` (zero bytes) and all co
 
 ### HAL (Hardware Abstraction Layer) — `src/hal.zig`
 
-The HAL provides three interfaces: `I2cDevice`, `GpioPin`, `SpiDevice`. Each has two backends selected at compile time by the `-Dsim` flag:
-
-- **Simulation**: `SimI2cBus` (256-byte register file), `SimGpio` (bool), `SimSpi` (length tracker)
-- **Linux**: `LinuxI2cBus` (opens `/dev/i2c-1`, uses `ioctl(I2C_SLAVE)` + `write()`/`read()`), `LinuxGpio` (sysfs export with direction config), `LinuxSpi` (writes to `/dev/spidev0.0`)
+The HAL provides interfaces for I2C, GPIO, and SPI. Simulation uses in-memory backends. On Linux, GPIO for the Pi commonly uses **memory-mapped `/dev/gpiomem`** register access (rather than legacy `/sys/class/gpio` on newer Pi OS images).
 
 The `HalContext` struct owns all 12 hardware interfaces (2 I2C devices, 1 SPI, 9 GPIO pins) and is passed by pointer to all subsystems.
 
@@ -69,9 +66,11 @@ Command classification functions (`isMovementCmd`, `isStopCmd`, `isTiltCmd`, etc
 
 ## Build Commands
 
+Requires **Zig 0.14.x** (this repository’s `build.zig` matches the 0.14 `std.Build` API). On macOS: `brew install zig@0.14` and prepend `/opt/homebrew/opt/zig@0.14/bin` to `PATH`.
+
 ```bash
-zig build -Dsim=true                    # Build for simulation (x86_64)
-zig build test -Dsim=true               # Run 38 unit tests
+zig build -Dsim=true                    # Build for simulation (any host)
+zig build test -Dsim=true               # Run unit tests
 zig build -Dsim=false -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast  # Cross-compile for Pi
 ```
 
@@ -85,9 +84,10 @@ zig build -Dsim=false -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast  # Cross
 - **PCA9685 register layout**: Each PWM channel has 4 registers at `0x06 + 4*channel` (ON_L, ON_H, OFF_L, OFF_H). 12-bit resolution (0-4095).
 - **ADS7830 uses raw I2C**: Not register-based. Use `rawWrite(&[_]u8{cmd_byte})` then `rawRead()`, not `writeReg`/`readReg`.
 
-## Companion Project
+## Companion Projects
 
-The **adeept-dashboard** project provides a React web UI and 55 E2E acceptance tests that validate this server's WebSocket protocol. Both the Bun simulation server and this Zig server pass the same 55 tests.
+- **`adeept-dashboard`**: React cockpit that connects over WebSocket only. It includes a **Node** `ws-server.mjs` simulator and `npm run test:protocol`, which exercise the AWR-V3 command contract. Run Zig or Python robot firmware on the Pi; run the dashboard on a development machine on the same LAN.
+- **Original Python firmware** (`Adeept_AWR-V3/Server/…`): reference implementation; often `ws://<pi>:8888`, Flask camera on `http://<pi>:5000`.
 
 ## Original Python Codebase Reference
 

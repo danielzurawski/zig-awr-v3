@@ -126,9 +126,7 @@ fn handleConnection(conn: std.net.Stream, robot: *main_mod.RobotState) void {
                 robot.move_cmd = msg;
                 robot.moving = true;
                 if (cfg.motor) {
-                    const turn = if (std.mem.eql(u8, msg, "forward")) "mid"
-                        else if (std.mem.eql(u8, msg, "backward")) "mid"
-                        else msg;
+                    const turn = if (std.mem.eql(u8, msg, "forward")) "mid" else if (std.mem.eql(u8, msg, "backward")) "mid" else msg;
                     const dir: i8 = if (std.mem.eql(u8, msg, "backward")) -1 else 1;
                     robot.motor.move(robot.speed, dir, turn);
                 }
@@ -197,6 +195,28 @@ fn handleConnection(conn: std.net.Stream, robot: *main_mod.RobotState) void {
             continue;
         }
 
+        if (protocol.isAudioCmd(msg)) {
+            {
+                robot_mutex.lock();
+                defer robot_mutex.unlock();
+                dispatchAudio(msg, robot);
+            }
+            const out = protocol.formatResponse(&resp_buf, .{}) catch continue;
+            sendWsText(conn, out) catch break;
+            continue;
+        }
+
+        if (protocol.isLightEffectCmd(msg)) {
+            {
+                robot_mutex.lock();
+                defer robot_mutex.unlock();
+                dispatchLightEffect(msg, robot);
+            }
+            const out = protocol.formatResponse(&resp_buf, .{}) catch continue;
+            sendWsText(conn, out) catch break;
+            continue;
+        }
+
         if (protocol.isSwitchCmd(msg)) {
             {
                 robot_mutex.lock();
@@ -247,10 +267,19 @@ fn dispatchFunction(cmd: []const u8, robot: *main_mod.RobotState) void {
         if (cfg.motor) robot.motor.stop();
     } else if (std.mem.eql(u8, cmd, "police")) {
         robot.functions.police = true;
-        if (cfg.led) robot.leds.police();
+        if (cfg.led) {
+            robot.leds.police();
+            for (0..6) |phase| {
+                robot.leds.policeTick(@intCast(phase));
+                std.time.sleep(80_000_000);
+            }
+        }
     } else if (std.mem.eql(u8, cmd, "policeOff")) {
         robot.functions.police = false;
-        if (cfg.led) robot.leds.breath(70, 70, 255);
+        if (cfg.led) {
+            robot.leds.setAll(.{ .r = 0, .g = 0, .b = 0 });
+            robot.leds.show();
+        }
     } else if (std.mem.eql(u8, cmd, "keepDistance")) {
         robot.functions.keep_distance = true;
     } else if (std.mem.eql(u8, cmd, "keepDistanceOff")) {
@@ -267,10 +296,70 @@ fn dispatchFunction(cmd: []const u8, robot: *main_mod.RobotState) void {
     }
 }
 
+fn dispatchAudio(cmd: []const u8, robot: *main_mod.RobotState) void {
+    if (!cfg.buzzer) return;
+    if (std.mem.startsWith(u8, cmd, "tone ")) {
+        var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
+        _ = iter.next();
+        const note = iter.next() orelse "C5";
+        const duration_raw = iter.next() orelse "160";
+        const duration_ms = std.fmt.parseInt(u32, duration_raw, 10) catch 160;
+        robot.buzzer.playNote(note, @min(duration_ms, 800));
+    } else if (std.mem.eql(u8, cmd, "tune seven_notes")) {
+        const tune = [_]@import("../audio/buzzer.zig").NoteEntry{
+            .{ .name = "C4", .duration_ms = 120 }, .{ .name = "D4", .duration_ms = 120 },
+            .{ .name = "E4", .duration_ms = 120 }, .{ .name = "F4", .duration_ms = 120 },
+            .{ .name = "G4", .duration_ms = 120 }, .{ .name = "A4", .duration_ms = 120 },
+            .{ .name = "B4", .duration_ms = 160 },
+        };
+        robot.buzzer.playTune(&tune);
+    } else if (std.mem.eql(u8, cmd, "tune baby_shark")) {
+        const tune = [_]@import("../audio/buzzer.zig").NoteEntry{
+            .{ .name = "G4", .duration_ms = 150 }, .{ .name = "A4", .duration_ms = 150 },
+            .{ .name = "C5", .duration_ms = 150 }, .{ .name = "C5", .duration_ms = 150 },
+            .{ .name = "C5", .duration_ms = 150 }, .{ .name = "C5", .duration_ms = 150 },
+            .{ .name = "C5", .duration_ms = 220 }, .{ .name = "A4", .duration_ms = 150 },
+            .{ .name = "G4", .duration_ms = 150 }, .{ .name = "A4", .duration_ms = 150 },
+            .{ .name = "C5", .duration_ms = 280 },
+        };
+        robot.buzzer.playTune(&tune);
+    } else if (std.mem.eql(u8, cmd, "tune happy_birthday")) {
+        robot.buzzer.playTune(&@import("../audio/buzzer.zig").HAPPY_BIRTHDAY);
+    }
+}
+
+fn dispatchLightEffect(cmd: []const u8, robot: *main_mod.RobotState) void {
+    if (!cfg.led) return;
+    if (std.mem.eql(u8, cmd, "lights_breath_blue")) {
+        robot.leds.breath(70, 70, 255);
+        for (0..12) |_| {
+            robot.leds.breathTick();
+            std.time.sleep(50_000_000);
+        }
+    } else if (std.mem.eql(u8, cmd, "lights_rainbow")) {
+        robot.leds.rainbow();
+        for (0..18) |_| {
+            robot.leds.rainbowTick();
+            std.time.sleep(40_000_000);
+        }
+    } else if (std.mem.eql(u8, cmd, "lights_flowing")) {
+        robot.leds.flowing(255, 128, 0);
+        for (0..16) |_| {
+            robot.leds.flowingTick();
+            std.time.sleep(45_000_000);
+        }
+    } else if (std.mem.eql(u8, cmd, "lights_off")) {
+        robot.leds.off();
+    }
+}
+
 fn dispatchSwitch(cmd: []const u8, robot: *main_mod.RobotState) void {
     if (cmd.len < 12) return;
     const port: usize = switch (cmd[7]) {
-        '1' => 0, '2' => 1, '3' => 2, else => return,
+        '1' => 0,
+        '2' => 1,
+        '3' => 2,
+        else => return,
     };
     const is_on = std.mem.endsWith(u8, cmd, "_on");
     robot.switches[port] = is_on;

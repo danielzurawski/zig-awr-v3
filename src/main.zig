@@ -64,9 +64,9 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("[AWR-V3 Zig] Starting with features: ", .{});
     try stdout.print("motor={} servo={} ultra={} line={} bat={} led={} buzz={} cam={} slam={} auto={} sim={}\n", .{
-        cfg.motor, cfg.servo, cfg.ultrasonic, cfg.line_tracker,
-        cfg.battery,    cfg.led,    cfg.buzzer,     cfg.camera,
-        cfg.slam,       cfg.autonomy, cfg.sim,
+        cfg.motor,   cfg.servo,    cfg.ultrasonic, cfg.line_tracker,
+        cfg.battery, cfg.led,      cfg.buzzer,     cfg.camera,
+        cfg.slam,    cfg.autonomy, cfg.sim,
     });
 
     // Initialize HAL

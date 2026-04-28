@@ -269,73 +269,72 @@ pub const LinuxI2cBus = struct {
 
 pub const LinuxGpio = struct {
     pin: u8,
-    exported: bool = false,
-    value_path: [48]u8 = undefined,
-    value_path_len: usize = 0,
+    fd: std.posix.fd_t = -1,
+    mem: ?[]align(std.heap.page_size_min) u8 = null,
 
     pub fn init(pin: u8) LinuxGpio {
         var self = LinuxGpio{ .pin = pin };
-        var pin_buf: [4]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&pin_buf);
-        stream.writer().print("{d}", .{pin}) catch return self;
-        const pin_str = stream.getWritten();
+        self.fd = std.posix.open("/dev/gpiomem", .{ .ACCMODE = .RDWR }, 0) catch -1;
+        if (self.fd < 0) return self;
 
-        const export_fd = std.posix.open("/sys/class/gpio/export", .{ .ACCMODE = .WRONLY }, 0) catch return self;
-        _ = std.posix.write(export_fd, pin_str) catch {};
-        std.posix.close(export_fd);
-
-        const is_input = (pin == 24 or pin == 22 or pin == 27 or pin == 17);
-
-        var dir_path: [64]u8 = undefined;
-        var dp_stream = std.io.fixedBufferStream(&dir_path);
-        dp_stream.writer().print("/sys/class/gpio/gpio{d}/direction", .{pin}) catch return self;
-        const dir_fd = std.posix.open(dir_path[0..dp_stream.pos], .{ .ACCMODE = .WRONLY }, 0) catch {
-            std.time.sleep(50_000_000); // 50ms
-            const retry_fd = std.posix.open(dir_path[0..dp_stream.pos], .{ .ACCMODE = .WRONLY }, 0) catch return self;
-            _ = std.posix.write(retry_fd, if (is_input) "in" else "out") catch {};
-            std.posix.close(retry_fd);
-            var path_stream2 = std.io.fixedBufferStream(&self.value_path);
-            path_stream2.writer().print("/sys/class/gpio/gpio{d}/value", .{pin}) catch return self;
-            self.value_path_len = path_stream2.pos;
-            self.exported = true;
+        self.mem = std.posix.mmap(
+            null,
+            4096,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            self.fd,
+            0,
+        ) catch {
+            std.posix.close(self.fd);
+            self.fd = -1;
             return self;
         };
-        _ = std.posix.write(dir_fd, if (is_input) "in" else "out") catch {};
-        std.posix.close(dir_fd);
 
-        var path_stream = std.io.fixedBufferStream(&self.value_path);
-        path_stream.writer().print("/sys/class/gpio/gpio{d}/value", .{pin}) catch return self;
-        self.value_path_len = path_stream.pos;
-        self.exported = true;
+        const is_input = (pin == 24 or pin == 22 or pin == 27 or pin == 17);
+        self.setFunction(if (is_input) 0 else 1);
+        if (!is_input) self.write(false);
         return self;
     }
 
+    fn regs(self: *LinuxGpio) ?[*]volatile u32 {
+        const mem = self.mem orelse return null;
+        return @as([*]volatile u32, @ptrCast(@alignCast(mem.ptr)));
+    }
+
+    fn setFunction(self: *LinuxGpio, function: u3) void {
+        const r = self.regs() orelse return;
+        const index: usize = self.pin / 10;
+        const shift: u5 = @intCast((self.pin % 10) * 3);
+        var value = r[index];
+        value &= ~(@as(u32, 0b111) << shift);
+        value |= @as(u32, function) << shift;
+        r[index] = value;
+    }
+
     pub fn read(self: *LinuxGpio) bool {
-        if (!self.exported or self.value_path_len == 0) return false;
-        const fd = std.posix.open(self.value_path[0..self.value_path_len], .{ .ACCMODE = .RDONLY }, 0) catch return false;
-        defer std.posix.close(fd);
-        var buf: [2]u8 = undefined;
-        const n = std.posix.read(fd, &buf) catch return false;
-        return n > 0 and buf[0] == '1';
+        const r = self.regs() orelse return false;
+        const bank: usize = self.pin / 32;
+        const bit: u5 = @intCast(self.pin % 32);
+        return (r[13 + bank] & (@as(u32, 1) << bit)) != 0;
     }
 
     pub fn write(self: *LinuxGpio, value: bool) void {
-        if (!self.exported or self.value_path_len == 0) return;
-        const fd = std.posix.open(self.value_path[0..self.value_path_len], .{ .ACCMODE = .WRONLY }, 0) catch return;
-        defer std.posix.close(fd);
-        const byte: [1]u8 = .{if (value) '1' else '0'};
-        _ = std.posix.write(fd, &byte) catch {};
+        const r = self.regs() orelse return;
+        const bank: usize = self.pin / 32;
+        const bit: u5 = @intCast(self.pin % 32);
+        const mask = @as(u32, 1) << bit;
+        const index: usize = (if (value) @as(usize, 7) else @as(usize, 10)) + bank;
+        r[index] = mask;
     }
 
     pub fn deinit(self: *LinuxGpio) void {
-        if (self.exported) {
-            var pin_buf: [4]u8 = undefined;
-            var stream = std.io.fixedBufferStream(&pin_buf);
-            stream.writer().print("{d}", .{self.pin}) catch return;
-            const unexport_fd = std.posix.open("/sys/class/gpio/unexport", .{ .ACCMODE = .WRONLY }, 0) catch return;
-            _ = std.posix.write(unexport_fd, stream.getWritten()) catch {};
-            std.posix.close(unexport_fd);
-            self.exported = false;
+        if (self.mem) |mem| {
+            std.posix.munmap(mem);
+            self.mem = null;
+        }
+        if (self.fd >= 0) {
+            std.posix.close(self.fd);
+            self.fd = -1;
         }
     }
 };

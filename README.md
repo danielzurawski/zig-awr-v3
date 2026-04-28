@@ -17,7 +17,7 @@ The original AWR-V3 firmware is Python with 15+ pip dependencies, consuming ~200
 ## Features
 
 - **11 compile-time feature toggles** — enable/disable subsystems at build time
-- **Dual HAL backends** — simulation (in-memory) and real Linux (ioctl/sysfs/SPI)
+- **Dual HAL backends** — simulation (in-memory) and real Linux (**I2C** via `ioctl`, **SPI** via `/dev/spidev*`, GPIO via memory-mapped **`/dev/gpiomem`** on Raspberry Pi targets)
 - **4-motor differential drive** — PCA9685 PWM register-level control
 - **8-channel servo controller** — pulse-width calculation with clamping and wiggle mode
 - **HC-SR04 ultrasonic** — GPIO trigger/echo with explicit timeout handling
@@ -32,7 +32,8 @@ The original AWR-V3 firmware is Python with 15+ pip dependencies, consuming ~200
 
 ## Prerequisites
 
-- [Zig](https://ziglang.org/download/) 0.14.0+
+- [Zig](https://ziglang.org/download/) **0.14.x**. This repo’s `build.zig` targets the Zig 0.14 build API (Zig **0.15+** renamed several `std.Build` options — use **0.14.x** until the project is ported).
+- On macOS with Homebrew: `brew install zig@0.14` then put `/opt/homebrew/opt/zig@0.14/bin` first on your `PATH`.
 - No other dependencies
 
 ## Quick Start
@@ -89,16 +90,7 @@ Disabled subsystems compile to `void` (zero bytes) and all related code is elimi
 zig build test -Dsim=true
 ```
 
-The firmware can also be validated with the 55 E2E acceptance tests from the companion `adeept-dashboard` project:
-
-```bash
-# Start the Zig server
-AWR_WS_USER=admin AWR_WS_PASS=123456 ./zig-out/bin/awr-v3 &
-
-# Run E2E tests (from the dashboard project)
-cd ../adeept-dashboard
-bun test
-```
+Companion **`adeept-dashboard`** provides **Node** WebSocket protocol acceptance tests (`npm run test:protocol`) against `ws-server.mjs`. That harness uses simulator-only HTTP helpers such as **`/capabilities`** and **`/state`** alongside the WebSocket stream. The Zig firmware validates with **`zig build test`**, on-device trials, and connecting the React dashboard to **`ws://<lan-ip>:8889`**.
 
 ## Project Structure
 

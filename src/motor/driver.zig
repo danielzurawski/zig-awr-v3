@@ -9,7 +9,7 @@ const MOTOR_CHANNELS = [4][2]u8{
     .{ 15, 14 }, // M1: IN1=ch15, IN2=ch14
     .{ 12, 13 }, // M2: IN1=ch12, IN2=ch13
     .{ 11, 10 }, // M3: IN1=ch11, IN2=ch10
-    .{ 8, 9 },   // M4: IN1=ch8,  IN2=ch9
+    .{ 8, 9 }, // M4: IN1=ch8,  IN2=ch9
 };
 
 const MOTOR_DIRS = [4]i8{ 1, -1, 1, -1 };
@@ -30,9 +30,9 @@ pub const MotorDriver = struct {
         const on_val: u16 = 0;
         const off_val: u16 = @min(pwm_value, 4095);
         const data = [4]u8{
-            @truncate(on_val),      // ON_L
+            @truncate(on_val), // ON_L
             @truncate(on_val >> 8), // ON_H
-            @truncate(off_val),     // OFF_L
+            @truncate(off_val), // OFF_L
             @truncate(off_val >> 8), // OFF_H
         };
         self.hal_ctx.i2c_pca9685.writeReg(reg, &data) catch {};

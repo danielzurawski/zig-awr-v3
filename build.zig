@@ -42,11 +42,27 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addOptions("config", options);
     b.installArtifact(exe);
 
+    // ── Hardware diagnostics executable ──────────────────────────────
+    const diag = b.addExecutable(.{
+        .name = "awr-v3-diag",
+        .root_source_file = b.path("src/diag.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    diag.root_module.addOptions("config", options);
+    b.installArtifact(diag);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the AWR-V3 firmware");
     run_step.dependOn(&run_cmd.step);
+
+    const run_diag_cmd = b.addRunArtifact(diag);
+    run_diag_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_diag_cmd.addArgs(args);
+    const diag_step = b.step("diag", "Run AWR-V3 hardware diagnostics");
+    diag_step.dependOn(&run_diag_cmd.step);
 
     // ── Unit tests ───────────────────────────────────────────────────
     const unit_tests = b.addTest(.{
