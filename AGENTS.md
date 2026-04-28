@@ -119,6 +119,25 @@ zig build -Dsim=false -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast  # Cross
 
 Both stacks share the I2C/GPIO peripherals on real hardware, so only one should run at a time on the HAT. Use the dashboard's connection presets (`Python robot` vs `Zig robot`) to point at whichever is active.
 
+## Functional acceptance test (Docker / Raspberry Pi OS)
+
+Use this when you cannot reach a real Pi but want empirical evidence that **install → run → control plane → protocol → uninstall** all work end-to-end.
+
+```bash
+bash zig-awr-v3/scripts/run-functional-acceptance.sh
+```
+
+Expectations the agent should encode in any change:
+
+- The orchestrator (`scripts/acceptance/run-in-container.sh`) exits **non-zero** if any assertion fails, and the final line is **`PASS: <n>` / `FAIL: 0`**.
+- Each phase is **independent**: a phase failing must not silently invalidate later phases. `set -uo pipefail` (no `-e`) keeps the harness running so we get the full report.
+- The systemctl stub (`docker/stub-systemctl`) is the **only** authority that proves what `install-pi.sh` and `awr-stack` actually called. Add new control-plane assertions by `grep`-ing `/var/log/stub-systemctl.log`.
+- The black-box `scripts/acceptance/ws-protocol-test.mjs` runs against **both** the Zig binary (phases D, G) and—via the dashboard's own `npm run test:protocol`—against the Node simulator (phase F). Treat it as the cross-implementation parity contract: any new WebSocket command should add an assertion here AND in the dashboard's `tests/ws-protocol.test.mjs`.
+- Build the Zig binary with `--build-mode sim` in the container. The HAL must remain side-effect free in sim mode (no `/dev/gpiomem`, `/dev/i2c-1`, `/dev/spidev0.0` access) or the binary won't start under the Pi OS userspace running on Docker.
+- The acceptance run is **fast (~30 s on Apple Silicon)** because Docker layer-caches `apt`, Node, and the repo COPY. The Zig 0.14.1 download (`zig-aarch64-linux-0.14.1.tar.xz` — note the arch-os ordering, which changed at 0.14) is fetched fresh inside the container so `install-pi.sh`'s download path is exercised every run.
+
+If a real Pi becomes available, the same install script runs unchanged: just drop `--build-mode sim` (defaults to `real`) and `awr-stack zig`.
+
 ## Original Python Codebase Reference
 
 This firmware reimplements the protocol from these original Python files:

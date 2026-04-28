@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+# Functional acceptance image for the Adeept AWR-V3 Zig firmware + dashboard.
+# Defaults to the de-facto Raspberry Pi OS Bookworm image so we exercise
+# `install-pi.sh`, the resulting binary, and the awr-stack helper on the
+# same userspace the Pi 3B/3B+ runs in production.
+#
+# Build with:
+#   docker build --platform linux/arm64 \
+#     -f zig-awr-v3/docker/Dockerfile.acceptance \
+#     -t awr-v3-acceptance \
+#     .
+#
+# (The build context must be a directory containing both `zig-awr-v3` and,
+# optionally, `adeept-dashboard` as siblings. See `scripts/run-functional-acceptance.sh`.)
+
+ARG BASE_IMAGE=dtcooper/raspberrypi-os:bookworm
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pre-install build deps that `install-pi.sh` would otherwise pull.
+# Doing it here keeps the test fast and makes failures inside the script
+# obviously about *script logic*, not network/apt flakiness.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl git tar xz-utils i2c-tools sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 22 (Raspberry Pi OS Bookworm ships Node 18 which is below the
+# dashboard's minimum). The dashboard tests need a real Node runtime
+# with the global WebSocket API.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+# Stub systemctl: records calls but never fails. Both `install-pi.sh`
+# and the runtime `awr-stack` helper will exercise this stub so we can
+# assert their control-plane behaviour without a real init system.
+COPY zig-awr-v3/docker/stub-systemctl /usr/local/bin/systemctl
+RUN chmod +x /usr/local/bin/systemctl
+
+# Bring both repositories in. The dashboard side is optional — if it is
+# not present, the orchestrator's dashboard phase will skip itself.
+WORKDIR /opt/test
+COPY zig-awr-v3 /opt/test/zig-awr-v3
+COPY adeept-dashboard /opt/test/adeept-dashboard
+
+# Avoid permission churn from `chown` calls inside the install script:
+# everything runs as root by default for a Docker-friendly install.
+ENV ACCEPTANCE_USER=root
+
+ENTRYPOINT ["bash", "/opt/test/zig-awr-v3/scripts/acceptance/run-in-container.sh"]

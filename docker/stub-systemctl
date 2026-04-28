@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Stub `systemctl` for use inside non-systemd containers (Docker).
+# Records every invocation to STUB_LOG so acceptance tests can assert
+# exactly which control-plane operations the install script and the
+# `awr-stack` helper would have performed.
+#
+# To "succeed" silently for queries (`is-active`, `is-enabled`, `status`),
+# we print conservative answers. Everything else is a no-op exit 0.
+
+LOG_FILE="${SYSTEMCTL_STUB_LOG:-/var/log/stub-systemctl.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
+printf '%s systemctl' "$(date +%FT%T)" >> "$LOG_FILE"
+for arg in "$@"; do printf ' %q' "$arg" >> "$LOG_FILE"; done
+printf '\n' >> "$LOG_FILE"
+
+case "${1:-}" in
+  is-enabled|is-active)
+    echo "inactive"
+    ;;
+  status)
+    echo "stub: would show status of $2"
+    ;;
+  *)
+    ;;
+esac
+exit 0

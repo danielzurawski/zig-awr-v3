@@ -92,6 +92,31 @@ zig build test -Dsim=true
 
 Companion **`adeept-dashboard`** provides **Node** WebSocket protocol acceptance tests (`npm run test:protocol`) against `ws-server.mjs`. That harness uses simulator-only HTTP helpers such as **`/capabilities`** and **`/state`** alongside the WebSocket stream. The Zig firmware validates with **`zig build test`**, on-device trials, and connecting the React dashboard to **`ws://<lan-ip>:8889`**.
 
+### Functional acceptance test (no Pi required)
+
+`scripts/run-functional-acceptance.sh` builds a Docker image based on the official **Raspberry Pi OS Bookworm** (`dtcooper/raspberrypi-os:bookworm`, `linux/arm64`) and runs an end-to-end black-box test of the entire stack. From the parent of this repo:
+
+```bash
+bash zig-awr-v3/scripts/run-functional-acceptance.sh
+```
+
+The orchestrator (`scripts/acceptance/run-in-container.sh`) executes 8 phases and emits **PASS/FAIL** per assertion plus a final summary (currently **50 / 50 PASS**, ~30 s on Apple Silicon):
+
+| Phase | What it proves |
+|---|---|
+| **A** | Pi OS Bookworm userspace, Node 22, `systemctl` stub, repos mounted |
+| **B** | `install-pi.sh --dry-run` announces every step (deps, Zig, stage, creds, unit, helper, daemon-reload) |
+| **C** | `install-pi.sh --build-mode sim` produces the `awr-v3` binary, `chmod 600` `credentials.env`, the systemd unit (correct `ExecStart`, `EnvironmentFile`, `WantedBy`), the `awr-stack` helper, calls `daemon-reload`, **and leaves the unit disabled** (no auto-start war with vendor Python) |
+| **D** | The compiled binary listens on `:8889` and passes the black-box `ws-protocol-test.mjs` (auth → `get_info` → `slam_reset` → `mapping` → 6× `forward` → `get_map` shows pose advanced and `mapping=true` → `slam_plan X Y` → 4× `rotate-left` changes `theta` → `mappingOff` clears flag → `DS`/`TS` ack) |
+| **E** | `awr-stack {zig,python,stop,status}` issues exactly the right `systemctl` calls (recorded by the stub) |
+| **F** | The dashboard's `npm run test:protocol` suite (incl. SLAM acceptance) passes against the Node simulator |
+| **G** | The same generic `ws-protocol-test.mjs` passes against the **Zig binary** — proves cross-implementation parity Zig ⇆ Node |
+| **H** | `uninstall-pi.sh` removes prefix, unit, and credentials and stops the service |
+
+The acceptance suite uses a stubbed `/usr/local/bin/systemctl` (`docker/stub-systemctl`) that records every invocation to `/var/log/stub-systemctl.log`, so we can assert the install-pi.sh / awr-stack control plane behaviour without booting a real init system inside the container. The Zig binary is built with `-Dsim=true` so its HAL doesn't try to open `/dev/gpiomem` or `/dev/i2c-1`, but the network protocol, SLAM dispatch, occupancy-grid logic, pose integration, and path planner are the same code paths as on the Pi.
+
+If you only have `zig-awr-v3` (no `adeept-dashboard` sibling), phases F & G self-skip with a printed note instead of failing.
+
 ## Project Structure
 
 ```
@@ -117,10 +142,17 @@ zig-awr-v3/
 │   └── net/
 │       ├── ws_server.zig              # WebSocket server (raw TCP + RFC 6455) + live SLAM dispatch
 │       └── protocol.zig               # Command parser + JSON response builder
-└── scripts/
-    ├── install-pi.sh                  # One-shot Pi installer (Zig + service + helper)
-    ├── uninstall-pi.sh                # Removes the Zig stack only (vendor stack untouched)
-    └── awr-stack                      # Toggle helper for vendor Python vs Zig services
+├── scripts/
+│   ├── install-pi.sh                  # One-shot Pi installer (Zig + service + helper)
+│   ├── uninstall-pi.sh                # Removes the Zig stack only (vendor stack untouched)
+│   ├── awr-stack                      # Toggle helper for vendor Python vs Zig services
+│   ├── run-functional-acceptance.sh   # Build + run the Docker acceptance container
+│   └── acceptance/
+│       ├── run-in-container.sh        # 8-phase black-box orchestrator (in-container)
+│       └── ws-protocol-test.mjs       # Generic WS protocol test (works vs Zig and Node)
+└── docker/
+    ├── Dockerfile.acceptance          # Pi OS Bookworm + Node 22 + stubbed systemctl
+    └── stub-systemctl                 # Records every systemctl call for assertions
 ```
 
 ## WebSocket Protocol

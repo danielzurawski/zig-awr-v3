@@ -17,10 +17,14 @@
 
 set -euo pipefail
 
-USAGE="Usage: $0 [--user USER] [--prefix PATH] [--zig-version 0.14.1] [--dry-run]"
-TARGET_USER="${SUDO_USER:-${USER}}"
+USAGE="Usage: $0 [--user USER] [--prefix PATH] [--zig-version 0.14.1] [--build-mode real|sim] [--dry-run]"
+# Default user: SUDO_USER (when invoked via sudo on a real Pi), else $USER,
+# else `root` so the script still parses arguments under `set -u` in
+# minimal environments such as Docker containers without USER set.
+TARGET_USER="${SUDO_USER:-${USER:-root}}"
 PREFIX="/opt/awr-v3-zig"
 ZIG_VERSION="0.14.1"
+BUILD_MODE="real"
 DRY_RUN=0
 
 while [ $# -gt 0 ]; do
@@ -28,11 +32,17 @@ while [ $# -gt 0 ]; do
     --user) TARGET_USER="$2"; shift 2;;
     --prefix) PREFIX="$2"; shift 2;;
     --zig-version) ZIG_VERSION="$2"; shift 2;;
+    --build-mode) BUILD_MODE="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     -h|--help) echo "$USAGE"; exit 0;;
     *) echo "Unknown arg: $1"; echo "$USAGE"; exit 1;;
   esac
 done
+
+case "$BUILD_MODE" in
+  real|sim) ;;
+  *) echo "Invalid --build-mode: $BUILD_MODE (real|sim)"; exit 1;;
+esac
 
 note() { echo "[install] $*"; }
 run() {
@@ -45,7 +55,7 @@ run() {
 
 if [ "$DRY_RUN" = 0 ] && [ "$EUID" -ne 0 ]; then
   note "Re-running with sudo..."
-  exec sudo "$0" --user "$TARGET_USER" --prefix "$PREFIX" --zig-version "$ZIG_VERSION"
+  exec sudo "$0" --user "$TARGET_USER" --prefix "$PREFIX" --zig-version "$ZIG_VERSION" --build-mode "$BUILD_MODE"
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.."; pwd)"
@@ -85,18 +95,33 @@ if [ "$need_zig" = 1 ]; then
     x86_64) ZARCH="x86_64";;
     *) note "Unsupported arch for prebuilt Zig: $ARCH"; exit 1;;
   esac
-  URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZARCH}-${ZIG_VERSION}.tar.xz"
+  # Zig 0.14.x reorganised official tarballs: the order is now arch-os.
+  # Probe both layouts so this script works with 0.13 and 0.14 releases.
+  URL_NEW="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz"
+  URL_OLD="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZARCH}-${ZIG_VERSION}.tar.xz"
+  if curl -fsI "$URL_NEW" >/dev/null 2>&1; then
+    URL="$URL_NEW"
+    DIR_NAME="zig-${ZARCH}-linux-${ZIG_VERSION}"
+  else
+    URL="$URL_OLD"
+    DIR_NAME="zig-linux-${ZARCH}-${ZIG_VERSION}"
+  fi
   note "Downloading $URL"
   run "mkdir -p /opt"
   run "curl -fsSL $URL | tar -xJ -C /opt"
-  run "ln -sf /opt/zig-linux-${ZARCH}-${ZIG_VERSION}/zig /usr/local/bin/zig"
+  run "ln -sf /opt/${DIR_NAME}/zig /usr/local/bin/zig"
 fi
 
-note "Step 3: stage repository at $PREFIX and build"
+note "Step 3: stage repository at $PREFIX and build (mode=$BUILD_MODE)"
 run "mkdir -p $PREFIX"
 run "cp -r $REPO_ROOT/. $PREFIX/"
 run "chown -R $TARGET_USER $PREFIX"
-run "su - $TARGET_USER -c 'cd $PREFIX && /usr/local/bin/zig build -Doptimize=ReleaseSafe -Dsim=false'"
+if [ "$BUILD_MODE" = "sim" ]; then
+  ZIG_FLAGS="-Doptimize=ReleaseSafe -Dsim=true"
+else
+  ZIG_FLAGS="-Doptimize=ReleaseSafe -Dsim=false"
+fi
+run "su - $TARGET_USER -c 'cd $PREFIX && /usr/local/bin/zig build $ZIG_FLAGS'"
 
 note "Step 4: ensure credentials env file exists"
 run "mkdir -p $(dirname "$ENV_FILE")"
