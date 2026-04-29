@@ -101,7 +101,16 @@ zig build -Dsim=false -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast  # Cross
 
 ## Companion Projects
 
-- **`adeept-dashboard`**: React cockpit that connects over WebSocket only. It includes a **Node** `ws-server.mjs` simulator and `npm run test:protocol`, which exercise the AWR-V3 command contract (including the SLAM track). Run Zig or Python robot firmware on the Pi; run the dashboard on a development machine on the same LAN.
+- **`adeept-dashboard`**: React cockpit that connects over WebSocket only. It ships:
+  - A **Node** `ws-server.mjs` simulator and `npm run test:protocol` for the AWR-V3 command
+    contract (including the SLAM track).
+  - Two **Playwright** projects: `chromium` (default; runs the UI against the Node simulator —
+    87 tests, ~58 s) and `chromium-live-pi` (drives the same UI against a real Pi running this
+    Zig firmware — 48 tests, ~3 min, asserts hardware via SSH+`smbus2` PCA9685 reads and
+    SSH+`pinctrl` GPIO reads). The orchestrator for the live-Pi run lives in this repo at
+    `scripts/run-live-pi-e2e.sh`.
+  Run Zig or Python robot firmware on the Pi; run the dashboard on a development machine on
+  the same LAN.
 - **Original Python firmware** (`Adeept_AWR-V3/Server/…`): reference implementation; often `ws://<pi>:8888`, Flask camera on `http://<pi>:5000`. Coexists with this stack via `awr-stack`.
 
 ## Pi installation & coexistence
@@ -132,8 +141,8 @@ bash zig-awr-v3/scripts/run-functional-acceptance.sh
 
 Expectations the agent should encode in any change:
 
-- The orchestrator (`scripts/acceptance/run-in-container.sh`) exits **non-zero** if any assertion fails. The final line must be **`PASS: <n>` / `FAIL: 0`** — currently 88 / 0.
-- The suite is **dual-stack first**. Phases A–H exercise the Zig firmware in isolation. Phases I–M install and exercise the vendor Adeept Python firmware (`setup.py` + `WebServer.py`) on top of the Zig install, prove both run concurrently (vendor on `:8888`, Zig on `:8889`), prove `awr-stack` toggles cleanly with both present, and prove a full uninstall returns the system to a clean state. Treat any deviation in cross-stack coexistence — Zig clobbering vendor or vice versa — as a hard failure.
+- The orchestrator (`scripts/acceptance/run-in-container.sh`) exits **non-zero** if any assertion fails. The final line must be **`PASS: <n>` / `FAIL: 0`** — currently 115 / 0 (88 control / protocol / coexistence + 25 in-situ rehearsal + 2 meta-asserts).
+- The suite is **dual-stack first**. Phases A–H exercise the Zig firmware in isolation. Phases I–M install and exercise the vendor Adeept Python firmware (`setup.py` + `WebServer.py`) on top of the Zig install, prove both run concurrently (vendor on `:8888`, Zig on `:8889`), prove `awr-stack` toggles cleanly with both present, and prove a full uninstall returns the system to a clean state. **Phase N** runs `scripts/in-situ-test.sh --rehearsal` end-to-end against the same Bookworm container (forwarded into the outer summary so any in-situ regression reduces the outer PASS count). Treat any deviation in cross-stack coexistence — Zig clobbering vendor or vice versa — as a hard failure.
 - Each phase is **independent**: a phase failing must not silently invalidate later phases. `set -uo pipefail` (no `-e`) keeps the harness running so we get the full report.
 - The systemctl stub (`docker/stub-systemctl`) is the **only** authority that proves what `install-pi.sh`, the vendor `setup.py`, and `awr-stack` actually called. Add new control-plane assertions by `grep`-ing `/var/log/stub-systemctl.log`.
 - The black-box `scripts/acceptance/ws-protocol-test.mjs` runs against **three** backends and asserts a different envelope per backend label:
@@ -147,6 +156,66 @@ Expectations the agent should encode in any change:
 - The acceptance run is ~100 s on Apple Silicon (Docker layer-caches `apt`, Node, Python, and the repo COPY; Zig 0.14.1 is fetched fresh inside the container — note `zig-aarch64-linux-0.14.1.tar.xz`, the arch-os ordering changed at 0.14).
 
 If a real Pi becomes available, the same install scripts run unchanged: just drop `--build-mode sim` (defaults to `real`), use the real vendor `setup.py` (no patching needed because the apt/pip/reboot lines are intentional on hardware), and `awr-stack zig` / `awr-stack python` to toggle live.
+
+## In-situ acceptance test (real hardware on the Pi)
+
+`scripts/in-situ-test.sh` is the on-Pi counterpart to the Docker suite. It is **the contract for "does it actually work on hardware"**: install + boot + protocol + dual-stack + awr-stack + restore, all against `/dev/gpiomem`, real I2C ADS7830/PCA9685, real systemd, real LAN. Drive it from the developer host:
+
+```bash
+bash zig-awr-v3/scripts/run-in-situ-test.sh \
+  --host raspberry-pi.local --user dmz \
+  --remote-protocol           # also re-run the WS test from the host
+```
+
+Expectations the agent should encode in any change:
+
+- The Pi-side runner (`scripts/in-situ-test.sh`) is **safe by default** — `--no-motion` is auto-enabled when battery is < 50% (overridable with `--allow-low-battery`). When in `--no-motion`, motor / servo-driving commands are dropped from the protocol test via `WS_SKIP_MOTION=1` and SLAM is force-disabled. Add `--with-slam` only when the wheels are clear.
+- **Rehearsal mode** (`--rehearsal`, auto-enabled when `/.dockerenv` exists or `/dev/gpiomem` is missing) skips the hardware probes (Pi sysfs, `/dev/gpiomem`, `/dev/i2c-1`, `/dev/spidev0.0`, `i2cdetect`), skips the ADS7830 battery readout, forces `--build-mode sim`, asserts `awr-stack` against `$SYSTEMCTL_STUB_LOG` (the Docker-image's recording stub), and routes vendor `WebServer.py` through `scripts/acceptance/run-vendor-server.sh` (with the `docker/vendor_stubs/` PYTHONPATH) so the same code path runs in CI. **Anything you change in `in-situ-test.sh` must keep Phase N of the Docker acceptance green** — it's the cheap regression net for this script before the Pi sees it.
+- The runner **snapshots** the systemd state of `Adeept_Robot.service` and `awr-v3-zig.service` before doing anything, and **restores** that snapshot in phase J unless the operator passes `--keep-zig` / `--keep-vendor` / `--keep-current`. Never leave the Pi in a different stack state than the operator started in.
+- Phase A asserts hardware presence (`/dev/gpiomem`, `/dev/i2c-1`, `/dev/spidev0.0`, `i2cdetect -y 1` finds 0x40 + 0x48). If you change the HAT wiring, those assertions move with you.
+- Phase E starts the Zig binary in the foreground and runs `ws-protocol-test.mjs` over `ws://127.0.0.1:8889`. Phase H does the same with vendor `WebServer.py` on `:8888` and Zig on `:8889` **concurrently**. Phase F drives `awr-stack` against **real systemd** (no stub) and asserts the right port becomes / stops being bound.
+- Treat any drift between the Docker phases (A–M) and the in-situ phases (A–J) as a fixable inconsistency — both must keep passing. The Docker version covers control-plane / protocol; the in-situ version covers everything the Docker version cannot (real GPIO/I2C/SPI, real systemd, real LAN).
+- The host-side driver (`scripts/run-in-situ-test.sh`) is just `rsync + ssh`; it intentionally does not have its own logic so the Pi-side script remains the single source of truth.
+
+If you change anything in `install-pi.sh`, `awr-stack`, the WebSocket protocol, or the SLAM dispatch, you must verify both the Docker suite (`PASS: <N> / FAIL: 0`) and the in-situ suite are still green.
+
+## Live-Pi Playwright suite (UI ↔ Zig firmware ↔ hardware)
+
+The on-Pi runner above covers protocol-level conformance. The complementary
+**`scripts/run-live-pi-e2e.sh`** orchestrator drives the dashboard's
+`chromium-live-pi` Playwright project against the same Pi to verify
+the full *user-visible* chain — React UI → WebSocket frame → Zig dispatcher →
+PCA9685 / GPIO → motor coils + LEDs + servo. The suite reads PCA9685 channel
+duty cycles via `smbus2` (over SSH) and GPIO pin levels via `pinctrl` to assert
+the firmware actually drove the right hardware for each user action.
+
+```bash
+bash scripts/run-live-pi-e2e.sh \
+    --host raspberry-pi.local --user dmz --password 'YOUR_PI_PASSWORD'
+# (or --use-agent for SSH key + agent auth)
+```
+
+Expectations the agent should encode in any change:
+
+- The orchestrator switches the Pi to `awr-stack zig` before the suite runs and
+  pre-flight-asserts that PCA9685 ch08–ch15 = 0; it refuses to start if motors are
+  not idle. After the suite it post-flights the same way.
+- A `trap '...' EXIT INT TERM` always quiesces the firmware on the way out, so a
+  failed test or Ctrl-C does not leave the wheels spinning.
+- Live-Pi specs live in `adeept-dashboard/tests/e2e/live/`. Page objects are shared
+  with the simulator suite under `adeept-dashboard/tests/e2e/pages/`. Hardware
+  probes are isolated in `tests/e2e/utils/pi-pca9685.ts` (with the `MOTOR_INTENT`
+  table derived from `src/motor/driver.zig`'s `MOTOR_CHANNELS` + `MOTOR_DIRS`) and
+  `tests/e2e/utils/pi-gpio.ts`.
+- Anything that changes the Zig dispatch table (new commands, channel remap, GPIO
+  remap, etc.) must keep this suite green. If you change `MOTOR_CHANNELS` or
+  `MOTOR_DIRS` in `motor/driver.zig`, you must also update `MOTOR_INTENT` in
+  `pi-pca9685.ts` — they are the same contract expressed twice.
+- The Zig firmware acks every command with `{status:ok}`, so the dashboard's
+  command log doubles as a generic "did the firmware accept this frame?" probe
+  for vendor-only commands (lights effects, CV modes) that the Zig firmware
+  silently ignores today. The live-Pi suite asserts those via the log instead of
+  via hardware.
 
 ## Original Python Codebase Reference
 

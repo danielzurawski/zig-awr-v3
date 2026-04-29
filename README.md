@@ -166,7 +166,7 @@ export VENDOR_SRC=/path/to/Adeept_AWR-V3
 bash zig-awr-v3/scripts/run-functional-acceptance.sh
 ```
 
-The orchestrator (`scripts/acceptance/run-in-container.sh`) runs 13 phases and emits **PASS / FAIL** per assertion plus a final summary (currently **88 / 88 PASS**, ~100 s on Apple Silicon):
+The orchestrator (`scripts/acceptance/run-in-container.sh`) runs 14 phases and emits **PASS / FAIL** per assertion plus a final summary (currently **115 / 115 PASS**, ~70 s on Apple Silicon — 88 from phases A–M, 25 from the in-situ rehearsal in phase N, plus 2 meta-asserts that the rehearsal exits 0 with FAIL=0 and emits its summary block):
 
 | Phase | Stack | What it proves |
 |---|---|---|
@@ -183,6 +183,7 @@ The orchestrator (`scripts/acceptance/run-in-container.sh`) runs 13 phases and e
 | **K** | Both | **Live dual-stack**: vendor Python on `:8888` and Zig binary on `:8889` run *concurrently*, and the protocol test passes against both backends simultaneously |
 | **L** | Both | With both stacks installed, `awr-stack zig`, `awr-stack python`, `awr-stack both`, and `awr-stack stop` all produce the correct `systemctl` dispatch |
 | **M** | Both | Zig uninstall + vendor cleanup leaves no service files, no startup.sh, no prefix — full clean teardown |
+| **N** | In-situ | `scripts/in-situ-test.sh --rehearsal` runs end-to-end in the same Bookworm container — re-installs the Zig stack from clean, boots the Zig binary on `:8889`, boots vendor `WebServer.py` on `:8888` (via `run-vendor-server.sh` + stubs), asserts `awr-stack` against the systemctl stub log, runs the live dual-stack phase, and emits its own `IN-SITU SUMMARY` block. Catches any script-logic regression in the on-Pi runner before pushing to the Pi. |
 
 Mechanics worth knowing about:
 
@@ -190,6 +191,85 @@ Mechanics worth knowing about:
 - The Zig binary is built with `-Dsim=true` so its HAL doesn't try to open `/dev/gpiomem` or `/dev/i2c-1`, but the network protocol, SLAM dispatch, occupancy-grid logic, pose integration, and path planner are the same code paths as on the Pi.
 - The vendor Python is run with hardware-touching modules (`Move`, `RPIservo`, `Functions`, `RobotLight`, `Switch`, `Voltage`, `app`, `camera_opencv`, plus the Adafruit / `board` / `busio` libraries) replaced by no-op stubs in `docker/vendor_stubs/`. The **real** `WebServer.py` protocol code (auth, `recv_msg`, `robotCtrl`, `switchCtrl`, `functionSelect`, `configPWM`, `get_info`, JSON `findColorSet`) runs unchanged.
 - Phases F + G skip themselves if `adeept-dashboard` is absent. Phases I–M skip themselves if no vendor V3 source is found (or `VENDOR_SRC` is unset and no auto-detect target exists).
+
+### Live-Pi Playwright suite (dashboard ↔ Zig firmware ↔ hardware)
+
+The on-Pi acceptance above (`scripts/in-situ-test.sh`) covers the install / boot / WebSocket /
+coexistence chain but speaks the protocol directly — it does **not** drive the React UI.
+For end-to-end validation of the full *user-visible* chain
+(React UI → WS frame → Zig dispatcher → PCA9685 / GPIO → motor coils + LEDs + servo),
+the dashboard ships a second Playwright project (`chromium-live-pi`) plus this orchestrator:
+
+```bash
+# From this repo, with the bot on a stand and SSH credentials available.
+bash scripts/run-live-pi-e2e.sh \
+    --host raspberry-pi.local --user dmz --password 'YOUR_PI_PASSWORD'
+# (or --use-agent if you have a working SSH agent + key)
+```
+
+What it does:
+
+1. SSHes to the Pi and confirms the Zig service is reachable.
+2. `awr-stack zig` to ensure the Zig firmware is the active backend.
+3. Pre-flight: probes PCA9685 ch08–ch15 = 0 (motors quiescent); refuses to start otherwise.
+4. Runs `LIVE_PI=1 npm run test:e2e:live` in the dashboard repo — Chromium drives the React UI
+   while the suite reads PCA9685 channel duty cycles via `smbus2` and GPIO pin levels via
+   `pinctrl`, both over SSH.
+5. Post-flight: probes PCA9685 again to assert motors are back to idle.
+6. `trap '...' EXIT INT TERM` emergency-stops the firmware over WebSocket on any abnormal exit.
+
+Coverage (48 tests, ~3 min): every drive direction (PCA9685 H-bridge), Stop All, speed slider duty
+cycle, camera tilt + servo calibration on PCA9685 ch0, L/K keyboard shortcuts, LED Ports
+(GPIO 9/25/11), LED Wink macro, full SLAM lifecycle, telemetry round-trip with real CPU/RAM/temp,
+buzzer tunes, Demo Pad macros (Camera Nod, Tiny Forward Tap, Tiny Spin Tap), Robot Modes ON/OFF
+pairs, and vendor-only effects (verified TX/RX through the dashboard log even though Zig silently
+ignores them today).
+
+This is the gating check for "the React dashboard, the Zig firmware, and the hardware all line
+up". The bot **must be on a stand** for this run — wheels turn briefly during motion tests.
+
+### In-situ acceptance (on the Raspberry Pi)
+
+The on-Pi runner (`scripts/in-situ-test.sh`) is also exercised by Phase N of the Docker suite in **rehearsal mode** — that catches script-logic regressions *before* they hit the Pi. To close the remaining gap (real `/dev/gpiomem`, real I2C ADS7830/PCA9685, real systemd, real LAN), run the in-situ test from the host that has SSH access to the Pi:
+
+```bash
+# From the host (Mac/Linux); Pi must be on the same Wi-Fi/LAN with key-based SSH.
+bash zig-awr-v3/scripts/run-in-situ-test.sh \
+  --host raspberry-pi.local --user dmz \
+  --remote-protocol            # also run ws-protocol-test from the host
+```
+
+What it does:
+
+1. Probes Pi reachability (SSH banner, kernel, uptime).
+2. `rsync`s `zig-awr-v3` to `~/zig-awr-v3` on the Pi (excludes `.git`, `zig-cache`, `zig-out`, `node_modules`).
+3. SSHes in and runs `sudo bash ~/zig-awr-v3/scripts/in-situ-test.sh` with the right flags.
+4. Optionally re-runs `ws-protocol-test.mjs` from the host against `ws://<pi>:8889` (the path the dashboard takes).
+
+The Pi-side runner (`scripts/in-situ-test.sh`) executes 10 phases and is **safe by default**:
+
+| Phase | What it proves |
+|---|---|
+| **A** | Pi OS Bookworm sysfs model, `/dev/gpiomem`, `/dev/i2c-1`, `/dev/spidev0.0`, Node/npm/Python toolchain |
+| **B** | Battery voltage via ADS7830 ch0 — auto-enables `--no-motion` below 50% (override with `--allow-low-battery`) |
+| **C** | Snapshot of `Adeept_Robot.service` + `awr-v3-zig.service` enable/active state for end-of-run restore |
+| **D** | `install-pi.sh --build-mode real` builds the Zig binary, installs the systemd unit, lands `awr-stack`, sets credentials at `chmod 600` |
+| **E** | Zig binary boots, listens on `:8889`, passes `ws-protocol-test.mjs` over localhost |
+| **F** | `awr-stack zig` / `awr-stack python` / `awr-stack stop` / `awr-stack status` against **real systemd** — verifies the right service is up/down with each toggle |
+| **G** | Vendor `WebServer.py` boots from `~/Adeept_AWR-V3/Server/` and passes the protocol subset on `:8888` |
+| **H** | Vendor `:8888` + Zig `:8889` running concurrently; protocol test passes against both **simultaneously on real hardware** |
+| **I** | Prints the LAN-reachable WebSocket URLs (the ones the dashboard would target) |
+| **J** | Restores the snapshotted service state (or `--keep-zig` / `--keep-vendor` / `--keep-current`) |
+
+Safety knobs:
+
+- `--no-motion` — strips motor and servo-driving commands from the protocol test (uses `WS_SKIP_MOTION=1`). Use when wheels are on the floor.
+- `--with-slam` — also exercises SLAM (mapping, get_map, slam_plan, theta change). Requires the robot to be on a stand and `--no-motion` *not* set.
+- `--allow-low-battery` — proceed with motor tests even if the pack is below 50%.
+- `--keep-zig` / `--keep-vendor` / `--keep-current` — don't snapshot-restore; leave the chosen backend running.
+- `--rehearsal` — Docker / non-Pi mode (auto-enabled when `/.dockerenv` exists or `/dev/gpiomem` is missing). Skips hardware probes, forces `--no-motion`, builds the Zig binary in `--build-mode sim`, asserts `awr-stack` against `$SYSTEMCTL_STUB_LOG` instead of waiting for ports, and uses `scripts/acceptance/run-vendor-server.sh` (with the `docker/vendor_stubs/` PYTHONPATH) for the vendor server boot. This is exactly what Phase N of the Docker acceptance runs.
+
+If anything fails, look in `/tmp/awr-v3-in-situ-logs/` on the Pi for per-phase logs (`install.log`, `zig-binary.log`, `vendor-server.log`, `awr-stack-*.log`, `*-protocol*.log`).
 
 ## Project Structure
 
@@ -221,6 +301,9 @@ zig-awr-v3/
 │   ├── uninstall-pi.sh                # Removes the Zig stack only (vendor stack untouched)
 │   ├── awr-stack                      # Toggle helper for vendor Python vs Zig services
 │   ├── run-functional-acceptance.sh   # Build + run the dual-stack Docker acceptance run
+│   ├── run-in-situ-test.sh            # Host-side driver: rsync + SSH the in-situ test to a Pi
+│   ├── in-situ-test.sh                # Pi-side orchestrator: 10 phases against real hardware
+│   ├── run-live-pi-e2e.sh             # Mac-side orchestrator for the dashboard's live-Pi Playwright project
 │   └── acceptance/
 │       ├── run-in-container.sh        # 13-phase black-box orchestrator (in-container)
 │       ├── ws-protocol-test.mjs       # Generic WS test (works vs Zig, Node simulator, vendor Python)
