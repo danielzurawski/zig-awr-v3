@@ -17,22 +17,26 @@
 
 set -euo pipefail
 
-USAGE="Usage: $0 [--user USER] [--prefix PATH] [--zig-version 0.14.1] [--build-mode real|sim] [--dry-run]"
+USAGE="Usage: $0 [--user USER] [--prefix PATH] [--zig-version 0.14.1] [--node-major 22] [--build-mode real|sim] [--no-test-tools] [--dry-run]"
 # Default user: SUDO_USER (when invoked via sudo on a real Pi), else $USER,
 # else `root` so the script still parses arguments under `set -u` in
 # minimal environments such as Docker containers without USER set.
 TARGET_USER="${SUDO_USER:-${USER:-root}}"
 PREFIX="/opt/awr-v3-zig"
 ZIG_VERSION="0.14.1"
+NODE_MAJOR="22"
 BUILD_MODE="real"
 DRY_RUN=0
+INSTALL_TEST_TOOLS=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --user) TARGET_USER="$2"; shift 2;;
     --prefix) PREFIX="$2"; shift 2;;
     --zig-version) ZIG_VERSION="$2"; shift 2;;
+    --node-major) NODE_MAJOR="$2"; shift 2;;
     --build-mode) BUILD_MODE="$2"; shift 2;;
+    --no-test-tools) INSTALL_TEST_TOOLS=0; shift;;
     --dry-run) DRY_RUN=1; shift;;
     -h|--help) echo "$USAGE"; exit 0;;
     *) echo "Unknown arg: $1"; echo "$USAGE"; exit 1;;
@@ -55,7 +59,9 @@ run() {
 
 if [ "$DRY_RUN" = 0 ] && [ "$EUID" -ne 0 ]; then
   note "Re-running with sudo..."
-  exec sudo "$0" --user "$TARGET_USER" --prefix "$PREFIX" --zig-version "$ZIG_VERSION" --build-mode "$BUILD_MODE"
+  SUDO_ARGS=( --user "$TARGET_USER" --prefix "$PREFIX" --zig-version "$ZIG_VERSION" --node-major "$NODE_MAJOR" --build-mode "$BUILD_MODE" )
+  [ "$INSTALL_TEST_TOOLS" = 0 ] && SUDO_ARGS+=( --no-test-tools )
+  exec sudo "$0" "${SUDO_ARGS[@]}"
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.."; pwd)"
@@ -80,7 +86,29 @@ fi
 
 note "Step 1: install build dependencies"
 run "apt-get update -y"
-run "apt-get install -y build-essential curl tar xz-utils i2c-tools ca-certificates"
+run "apt-get install -y build-essential curl tar xz-utils i2c-tools ca-certificates gnupg"
+
+# Step 1b — Node.js. The in-situ acceptance runner and the dashboard
+# Playwright suite both shell out to `node` (built-in WebSocket lands in
+# Node 22) and `npm`. Pi OS Bookworm ships Node 18, which is too old.
+# We pin the major (default 22) and pull from NodeSource. Skip with
+# --no-test-tools if you don't need the acceptance / dashboard tooling.
+if [ "$INSTALL_TEST_TOOLS" = 1 ]; then
+  note "Step 1b: ensure Node.js $NODE_MAJOR.x + npm are installed"
+  need_node=1
+  if command -v node >/dev/null 2>&1; then
+    if node --version | grep -qE "^v(${NODE_MAJOR}|$((NODE_MAJOR+1))|$((NODE_MAJOR+2))|$((NODE_MAJOR+3))|$((NODE_MAJOR+4)))\."; then
+      need_node=0
+      note "node $(node --version) already present, leaving alone"
+    fi
+  fi
+  if [ "$need_node" = 1 ]; then
+    run "curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash -"
+    run "apt-get install -y --no-install-recommends nodejs"
+  fi
+else
+  note "Step 1b: skipping Node.js (--no-test-tools); ws-protocol-test and Playwright will be unavailable"
+fi
 
 note "Step 2: ensure Zig $ZIG_VERSION is installed"
 need_zig=1

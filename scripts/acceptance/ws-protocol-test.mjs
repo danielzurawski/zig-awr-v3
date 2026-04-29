@@ -19,6 +19,10 @@ const AUTH = process.env.WS_AUTH ?? "admin:123456";
 const TIMEOUT_MS = Number(process.env.WS_TIMEOUT_MS ?? 5000);
 const INCLUDE_SLAM = process.env.INCLUDE_SLAM === "1";
 const BACKEND_LABEL = process.env.BACKEND_LABEL ?? "unknown";
+// SKIP_MOTION: drop motor + servo-driving commands from the common
+// subset and force INCLUDE_SLAM off. Used by the in-situ runner when
+// the robot is not on a stand so the test does not pulse the wheels.
+const SKIP_MOTION = process.env.WS_SKIP_MOTION === "1";
 
 if (typeof globalThis.WebSocket !== "function") {
   console.error("Node 22+ is required (built-in WebSocket missing).");
@@ -70,7 +74,14 @@ async function authenticate(ws) {
 
 async function main() {
   const ws = await open();
-  const summary = { ok: false, backend_url: WS_URL, backend: BACKEND_LABEL, slam_tested: INCLUDE_SLAM };
+  const slamTested = INCLUDE_SLAM && !SKIP_MOTION;
+  const summary = {
+    ok: false,
+    backend_url: WS_URL,
+    backend: BACKEND_LABEL,
+    slam_tested: slamTested,
+    skip_motion: SKIP_MOTION,
+  };
   try {
     await authenticate(ws);
 
@@ -85,11 +96,14 @@ async function main() {
     for (const v of info.data) assert.ok(Number.isFinite(Number.parseFloat(v)), `get_info value not numeric: ${v}`);
     summary.get_info_len = info.data.length;
 
-    // 2. Movement and stop commands always ack
-    for (const cmd of ["forward", "DS", "backward", "DS", "left", "TS", "right", "TS",
-                       "rotate-left", "TS", "rotate-right", "TS",
-                       "up", "UDstop", "down", "UDstop"]) {
-      assert.equal(JSON.parse(await send(ws, cmd)).status, "ok", `cmd ${cmd}`);
+    // 2. Movement and stop commands always ack. Skipped in --no-motion
+    //    mode (in-situ when wheels are on the floor).
+    if (!SKIP_MOTION) {
+      for (const cmd of ["forward", "DS", "backward", "DS", "left", "TS", "right", "TS",
+                         "rotate-left", "TS", "rotate-right", "TS",
+                         "up", "UDstop", "down", "UDstop"]) {
+        assert.equal(JSON.parse(await send(ws, cmd)).status, "ok", `cmd ${cmd}`);
+      }
     }
 
     // 3. Speed setting
@@ -118,7 +132,7 @@ async function main() {
     assert.equal(colorReply.status, "ok");
 
     // ---------- SLAM extensions (Zig firmware + Node simulator only) ----------
-    if (INCLUDE_SLAM) {
+    if (slamTested) {
       assert.equal(JSON.parse(await send(ws, "slam_reset")).status, "ok");
       const before = JSON.parse(await send(ws, "get_map"));
       assert.equal(before.title, "get_map", "get_map title");
@@ -161,6 +175,23 @@ async function main() {
     summary.ok = true;
     console.log(JSON.stringify(summary));
   } finally {
+    // Safety net: zero the wheels and the camera tilt no matter how we
+    // got here (clean exit, assertion failure, timeout). The SLAM section
+    // intentionally streams `forward`/`rotate-left` without per-command
+    // stops to exercise pose accumulation; if the test errored mid-stream
+    // the PCA9685 would otherwise keep the last PWM duty cycle until the
+    // *next* command — which is how the robot ends up with wheels still
+    // spinning after an aborted run.
+    try {
+      if (ws.readyState === 1 /* OPEN */ && !SKIP_MOTION) {
+        for (const safeStop of ["DS", "TS", "UDstop"]) {
+          try { ws.send(safeStop); } catch {}
+        }
+        // Give the backend ~50 ms to flush motor PWM=0 over I2C before
+        // we tear down the connection.
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } catch {}
     try { ws.close(); } catch {}
   }
 }

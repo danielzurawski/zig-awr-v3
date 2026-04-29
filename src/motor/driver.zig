@@ -1,8 +1,20 @@
 const std = @import("std");
 const hal = @import("../hal.zig");
 
-// PCA9685 register base for LED/PWM channels
+// PCA9685 registers
+const MODE1: u8 = 0x00;
+const PRESCALE: u8 = 0xFE;
 const LED0_ON_L: u8 = 0x06;
+
+// MODE1 bits
+const MODE1_RESTART: u8 = 0x80;
+const MODE1_EXTCLK: u8 = 0x40;
+const MODE1_AI: u8 = 0x20; // auto-increment register pointer on writes
+const MODE1_SLEEP: u8 = 0x10; // low-power mode (oscillator off — must clear)
+
+// 25 MHz internal oscillator / (4096 * (prescale + 1)) = output Hz.
+// For 50 Hz (servos + the Adeept motor driver): prescale = 121.
+const PCA_PRESCALE_50HZ: u8 = 121;
 
 // Motor channel assignments matching Move.py
 const MOTOR_CHANNELS = [4][2]u8{
@@ -14,12 +26,50 @@ const MOTOR_CHANNELS = [4][2]u8{
 
 const MOTOR_DIRS = [4]i8{ 1, -1, 1, -1 };
 
+/// Wake the PCA9685 from its power-on default (SLEEP=1, AI=0), set the
+/// 50 Hz prescale required for both servos and the H-bridge inputs,
+/// then re-enable AUTO_INCREMENT so multi-byte channel writes actually
+/// land on consecutive registers.
+///
+/// Without this the chip stays in either:
+///   * power-on default (SLEEP=1, AI=0) — no PWM output at all, and
+///     multi-byte writes overwrite a single register repeatedly; or
+///   * a state left by Adafruit's `PCA9685(i2c)` constructor, which
+///     resets MODE1 to 0 (clears AI). Any tooling that reads the chip
+///     via Adafruit (including the in-situ test) will silently break
+///     subsequent firmware writes if AI isn't re-asserted by us.
+///
+/// Idempotent and safe to call repeatedly.
+pub fn initPca9685(ctx: *hal.HalContext) void {
+    // Step 1: enter SLEEP so the prescaler is writable.
+    ctx.i2c_pca9685.writeReg(MODE1, &[_]u8{MODE1_SLEEP}) catch {};
+    // Step 2: set prescale for 50 Hz.
+    ctx.i2c_pca9685.writeReg(PRESCALE, &[_]u8{PCA_PRESCALE_50HZ}) catch {};
+    // Step 3: leave SLEEP, enable AUTO_INCREMENT.
+    ctx.i2c_pca9685.writeReg(MODE1, &[_]u8{MODE1_AI}) catch {};
+    // Step 4: PCA9685 datasheet requires ≥500 µs after clearing SLEEP
+    // before normal operation; 5 ms is a generous margin used by every
+    // CircuitPython PCA9685 driver.
+    std.time.sleep(5 * std.time.ns_per_ms);
+    // Step 5: send RESTART (per datasheet, after the oscillator stabilises).
+    ctx.i2c_pca9685.writeReg(MODE1, &[_]u8{MODE1_RESTART | MODE1_AI}) catch {};
+}
+
 pub const MotorDriver = struct {
     hal_ctx: *hal.HalContext,
     throttle: [4]i16 = .{ 0, 0, 0, 0 },
 
+    /// Constructs the driver, configures the PCA9685 (see `initPca9685`),
+    /// and unconditionally zeroes every motor channel ("safe boot"). The
+    /// PCA9685 retains PWM duty cycles across host-process restarts, so
+    /// without `stop()` here a previous run that left motors mid-command
+    /// would keep the wheels spinning until the next motor command —
+    /// dangerous for a robot on a stand or unattended on the floor.
     pub fn init(ctx: *hal.HalContext) MotorDriver {
-        return .{ .hal_ctx = ctx };
+        initPca9685(ctx);
+        var driver = MotorDriver{ .hal_ctx = ctx };
+        driver.stop();
+        return driver;
     }
 
     /// Write a PWM value to a PCA9685 channel.

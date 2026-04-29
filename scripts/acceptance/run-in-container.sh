@@ -427,6 +427,65 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
+phase "N — in-situ-test.sh script logic (rehearsal pass)"
+# This validates scripts/in-situ-test.sh — the orchestrator we ship for
+# the on-Pi acceptance run — by executing it in rehearsal mode (auto-
+# detected via /.dockerenv). It re-installs the Zig stack from a clean
+# state, exercises awr-stack via the systemctl stub, boots the Zig
+# binary, boots the vendor WebServer.py via run-vendor-server.sh,
+# proves dual-stack live in this container, and ends by restoring the
+# snapshotted (empty) state. If anything in the script regresses, we
+# catch it here before pushing to a Pi.
+# ─────────────────────────────────────────────────────────────────────
+INSITU_LOG="$LOG_DIR/in-situ-rehearsal.log"
+INSITU_REPO="/opt/test/zig-awr-v3"
+INSITU_VENDOR="/opt/Adeept_AWR-V3"
+# Phase M removed VENDOR_PREFIX. Re-stage the vendor source so the
+# in-situ script's vendor-side phases can run.
+if [ "$VENDOR_PRESENT" = 1 ] && [ ! -d "$INSITU_VENDOR" ]; then
+  cp -r "$VENDOR_SRC" "$INSITU_VENDOR"
+fi
+
+set +e
+SYSTEMCTL_STUB_LOG="$SYSTEMCTL_LOG" \
+  bash "$INSITU_REPO/scripts/in-situ-test.sh" \
+    --user "$ACCEPTANCE_USER" \
+    --vendor-dir "$INSITU_VENDOR" \
+    --rehearsal \
+    --keep-current \
+    > "$INSITU_LOG" 2>&1
+INSITU_RC=$?
+set -e
+
+# Forward in-situ tallies into the outer summary so the orchestrator's
+# final PASS/FAIL count reflects every assertion, not just "did it
+# exit 0". This is critical: if the in-situ script soft-fails on a
+# single assertion but exits 0 by accident, we still see it here.
+INSITU_PASS=$(grep -c "^  PASS " "$INSITU_LOG" || true)
+INSITU_FAIL=$(grep -c "^  FAIL " "$INSITU_LOG" || true)
+PASS=$((PASS + INSITU_PASS))
+FAIL=$((FAIL + INSITU_FAIL))
+echo "  in-situ-test.sh tallied: PASS=$INSITU_PASS, FAIL=$INSITU_FAIL"
+if [ "$INSITU_RC" = 0 ] && [ "$INSITU_FAIL" = 0 ]; then
+  echo "  PASS [$PHASE] in-situ-test.sh --rehearsal exits 0 with FAIL=0"
+  PASS=$((PASS+1))
+else
+  echo "  FAIL [$PHASE] in-situ-test.sh exited $INSITU_RC with FAIL=$INSITU_FAIL"
+  FAIL=$((FAIL+1))
+  echo "  --- last 60 lines of in-situ rehearsal log ---"
+  tail -60 "$INSITU_LOG" | sed 's/^/    /'
+fi
+
+# Verify the in-situ runner's final summary line exists.
+if grep -q "=== IN-SITU SUMMARY ===" "$INSITU_LOG"; then
+  echo "  PASS [$PHASE] in-situ runner emitted final summary block"
+  PASS=$((PASS+1))
+else
+  echo "  FAIL [$PHASE] in-situ runner did not emit summary block"
+  FAIL=$((FAIL+1))
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 echo
 echo "=== ACCEPTANCE SUMMARY ==="
 echo "PASS: $PASS"

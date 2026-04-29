@@ -58,6 +58,35 @@ pub const FunctionState = struct {
     cv_line_follow: bool = false,
 };
 
+// ── Safe shutdown ────────────────────────────────────────────────────
+//
+// systemd sends SIGTERM when a service is stopped. Without a handler,
+// the binary exits immediately and the PCA9685 keeps whatever PWM duty
+// cycle it had — so a wheel mid-pulse keeps spinning until the chip is
+// repowered. The signal handler must be async-signal-safe, but raw I2C
+// `ioctl(I2C_RDWR)` writes are POSIX-async-signal-safe and that's all
+// MotorDriver.stop() does.
+var g_robot_for_shutdown: ?*RobotState = null;
+
+fn handleShutdownSignal(sig: c_int) callconv(.C) void {
+    _ = sig;
+    if (g_robot_for_shutdown) |robot| {
+        if (cfg.motor) robot.motor.stop();
+    }
+    std.posix.exit(0);
+}
+
+fn installShutdownHandlers() void {
+    if (cfg.sim) return; // signals are uninteresting in unit tests
+    var sigact = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
+    std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -75,8 +104,15 @@ pub fn main() !void {
     var hal_ctx = hal.HalContext.init();
     defer hal_ctx.deinit();
 
-    // Initialize robot state
+    // Initialize robot state. MotorDriver.init() zeroes PCA9685 motor
+    // channels as part of construction (safe-boot), so even if the
+    // chip retained PWM from a prior process we start at rest.
     var robot = RobotState.init(&hal_ctx);
+
+    // Wire up the SIGTERM/SIGINT handler before serving so a fast
+    // `systemctl stop` doesn't catch us mid-pulse.
+    g_robot_for_shutdown = &robot;
+    installShutdownHandlers();
 
     // Initialize SLAM if enabled
     if (cfg.slam) {

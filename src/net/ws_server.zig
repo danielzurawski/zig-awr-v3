@@ -538,7 +538,11 @@ fn dispatchLightEffect(cmd: []const u8, robot: *main_mod.RobotState) void {
 }
 
 fn dispatchSwitch(cmd: []const u8, robot: *main_mod.RobotState) void {
-    if (cmd.len < 12) return;
+    // "Switch_N_on" is 11 chars, "Switch_N_off" is 12 chars. The previous
+    // length floor of 12 silently dropped every "_on" command — the
+    // protocol still ack'd "ok" but no GPIO ever toggled, which is what
+    // the Stage 3 hardware-paths probe surfaced (LED 1/2/3 stayed `lo`).
+    if (cmd.len < 11) return;
     const port: usize = switch (cmd[7]) {
         '1' => 0,
         '2' => 1,
@@ -588,6 +592,13 @@ fn dispatchServo(cmd: []const u8, robot: *main_mod.RobotState) void {
 }
 
 fn generateInfoData(bufs: *[4][16]u8, robot: *main_mod.RobotState) [4][]const u8 {
+    // Field order matches vendor Server/info.py for the first three slots
+    // so the dashboard can use a single decoder against either backend:
+    //   data[0] = CPU temperature (°C, one decimal)
+    //   data[1] = CPU usage         (%, one decimal)
+    //   data[2] = memory usage      (%, one decimal)
+    //   data[3] = battery percentage (% — Zig-only extension; vendor
+    //              omits this slot so dashboards must treat it optional)
     if (cfg.battery) robot.battery.read();
     const cpu_temp = 40.0 + simRand() * 25.0;
     const cpu_use = 5.0 + simRand() * 40.0;
